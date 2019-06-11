@@ -218,14 +218,10 @@ static struct iio_context *scan(void)
 		iio_strerror(-ret, err_str, sizeof(err_str));
 		fprintf(stderr, "Scanning for IIO contexts failed: %s\n", err_str);
 		goto err_free_ctx;
-	}
-
-	if (ret == 0) {
+	} else if (ret == 0) {
 		printf("No IIO context found.\n");
 		goto err_free_info_list;
-	}
-
-	if (ret == 1) {
+	} else if (ret == 1) {
 		ctx = iio_create_context_from_uri(iio_context_info_get_uri(info[0]));
 	} else {
 		fprintf(stderr, "Multiple contexts found. Please select one using --uri:\n");
@@ -260,32 +256,15 @@ int main(int argc, char **argv)
 	while ((c = getopt_long(argc, argv, "+hn:u:t:b:s:T:a",
 					options, &option_index)) != -1) {
 		switch (c) {
-		case 'h':
-			usage();
-			return EXIT_SUCCESS;
-		case 'n':
-			arg_ip = optarg;
-			break;
-		case 'u':
-			arg_uri = optarg;
-			break;
-		case 'a':
-			scan_for_context = true;
-			break;
-		case 't':
-			trigger_name = optarg;
-			break;
-		case 'b':
-			buffer_size = atoi(optarg);
-			break;
-		case 's':
-			num_samples = atoi(optarg);
-			break;
-		case 'T':
-			timeout = atoi(optarg);
-			break;
-		case '?':
-			return EXIT_FAILURE;
+		case 'h': usage();						return EXIT_SUCCESS;
+		case 'n': arg_ip = optarg;				break;
+		case 'u': arg_uri = optarg;				break;
+		case 'a': scan_for_context = true;		break;
+		case 't': trigger_name = optarg;		break;
+		case 'b': buffer_size = atoi(optarg);	break;
+		case 's': num_samples = atoi(optarg);	break;
+		case 'T': timeout = atoi(optarg);		break;
+		case '?': 								return EXIT_FAILURE;
 		}
 	}
 

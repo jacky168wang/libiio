@@ -40,7 +40,7 @@
 }
 
 /* RX is input, TX is output */
-enum iodev { RX, TX };
+enum iodev { TX, RX, OR };
 
 /* common RX and TX streaming params */
 struct stream_cfg {
@@ -291,4 +291,4 @@ int main (int argc, char **argv)
 	shutdown();
 
 	return 0;
-} 
+}

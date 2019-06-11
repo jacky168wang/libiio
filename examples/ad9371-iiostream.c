@@ -45,6 +45,8 @@ enum iodev { RX, TX };
 
 /* common RX and TX streaming params */
 struct stream_cfg {
+	long long bw_hz; // Analog banwidth in Hz
+	long long fs_hz; // Baseband sample rate in Hz
 	long long lo_hz; // Local oscillator frequency in Hz
 };
 
@@ -189,6 +191,8 @@ bool cfg_ad9371_streaming_ch(struct iio_context *ctx, struct stream_cfg *cfg, en
 
 	rd_ch_lli(chn, "rf_bandwidth");
 	rd_ch_lli(chn, "sampling_frequency");
+	wr_ch_lli(chn, "rf_bandwidth",       cfg->bw_hz);
+	wr_ch_lli(chn, "sampling_frequency", cfg->fs_hz);
 
 	// Configure LO channel
 	printf("* Acquiring AD9371 %s lo channel\n", type == TX ? "TX" : "RX");
@@ -216,10 +220,14 @@ int main (int argc, char **argv)
 	signal(SIGINT, handle_sig);
 
 	// RX stream config
-	rxcfg.lo_hz = GHZ(2.5); // 2.5 GHz rf frequency
+	//rxcfg.bw_hz = MHZ(20);   // 20 MHz rf bandwidth
+	//rxcfg.fs_hz = MHZ(122.88);   // 122.88 MS/s rx sample rate
+	rxcfg.lo_hz = GHZ(3.5); // 3.5 GHz rf frequency
 
 	// TX stream config
-	txcfg.lo_hz = GHZ(2.5); // 2.5 GHz rf frequency
+	//txcfg.bw_hz = MHZ(20); // 20 MHz rf bandwidth
+	//txcfg.fs_hz = MHZ(122.88);   // 122.88 MS/s tx sample rate
+	txcfg.lo_hz = GHZ(3.5); // 3.5 GHz rf frequency
 
 	printf("* Acquiring IIO context\n");
 	ASSERT((ctx = iio_create_default_context()) && "No context");
@@ -275,7 +283,7 @@ int main (int argc, char **argv)
 		// READ: Get pointers to RX buf and read IQ from RX buf port 0
 		p_inc = iio_buffer_step(rxbuf);
 		p_end = iio_buffer_end(rxbuf);
-		for (p_dat = iio_buffer_first(rxbuf, rx0_i); p_dat < p_end; p_dat += p_inc) {
+		for (p_dat = (char *)iio_buffer_first(rxbuf, rx0_i); p_dat < p_end; p_dat += p_inc) {
 			// Example: swap I and Q
 			const int16_t i = ((int16_t*)p_dat)[0]; // Real (I)
 			const int16_t q = ((int16_t*)p_dat)[1]; // Imag (Q)
@@ -286,7 +294,7 @@ int main (int argc, char **argv)
 		// WRITE: Get pointers to TX buf and write IQ to TX buf port 0
 		p_inc = iio_buffer_step(txbuf);
 		p_end = iio_buffer_end(txbuf);
-		for (p_dat = iio_buffer_first(txbuf, tx0_i); p_dat < p_end; p_dat += p_inc) {
+		for (p_dat = (char *)iio_buffer_first(txbuf, tx0_i); p_dat < p_end; p_dat += p_inc) {
 			// Example: fill with zeros
 			// 14-bit sample needs to be MSB alligned so shift by 2
 			// https://wiki.analog.com/resources/eval/user-guides/ad-fmcomms2-ebz/software/basic_iq_datafiles#binary_format

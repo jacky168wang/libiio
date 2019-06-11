@@ -189,9 +189,9 @@ static struct iio_context *scan(void)
 		}
 	}
 
-	err_free_info_list:
+err_free_info_list:
 	iio_context_info_list_free(info);
-	err_free_ctx:
+err_free_ctx:
 	iio_scan_context_destroy(scan_ctx);
 
 	return ctx;
