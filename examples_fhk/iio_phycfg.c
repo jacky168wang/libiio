@@ -1,6 +1,6 @@
 /*
  * applications based on libiio
- *   - AD9371 IIO streaming example
+ *   - RFIC IIO streaming example
  *
  * Copyright (C) 2018~2020 FACC Inc.
  * Author: Junyi Zhang <jun-yi.zhang@foxconn.com>
@@ -30,17 +30,6 @@
 #include "common_jacky.h"
 #include "rru_bbu.h"
 
-/* helper macros */
-#define MHZ(x) ((long long)(x*1000000.0 + .5))
-#define GHZ(x) ((long long)(x*1000000000.0 + .5))
-
-#define ASSERT(expr) { \
-	if (!(expr)) { \
-		(void) fprintf(stderr, "assertion failed (%s:%d)\n", __FILE__, __LINE__); \
-		(void) abort(); \
-	} \
-}
-
 /* common PHY RF params */
 struct rfcfg {
 	long long bw_hz; // Analog banwidth in Hz
@@ -49,6 +38,7 @@ struct rfcfg {
     double gain;
     bool qec_tcal;
     bool lol_tcal;//TX-ONLY
+	bool pwrdown;
 };
 
 struct rfcfg rxchn_rfcfg = {
@@ -58,21 +48,18 @@ struct rfcfg rxchn_rfcfg = {
 struct rfcfg txchn_rfcfg = {
 	0, 0, GHZ(3.5), -20, 1, 0
 };
+
 /* IIO structs required for streaming */
 static struct iio_context *ctx;
+
 // PHY devices
 static struct iio_device *rfdev[TOT_CHIP_NB];
 
-/* RX is input, TX is output */
-enum iopath { RX, TX, OR };
-static const char *str_path[] = {
-	"RX", "TX", "OR"
-};
 #define EN_IIO_PATH_RX (1 << RX)
 #define EN_IIO_PATH_TX (1 << TX)
        unsigned int g_pth_msk = EN_IIO_PATH_TX | EN_IIO_PATH_RX;
 static unsigned int g_m_verbo = 0;
-//#define BIT(n) (1 << n)
+
 static unsigned int g_chn_msk = BIT(0); // 2T2R
 //static unsigned int g_chn_msk = BIT(0) | BIT(1); // 4T4R
 //static unsigned int g_chn_msk = BIT(0) | BIT(1) | BIT(2) | BIT(3); // 8T8R
@@ -133,7 +120,7 @@ static void get_args(int argc, char **argv)
 			rxchn_rfcfg->qec_tcal = strtoul(optarg, NULL,  0);	
 			txchn_rfcfg->qec_tcal = strtoul(optarg, NULL,  0);		break;
 	    case 't': 	
-	    	txchn_rfcfg->lol_tcal = strtoul(optarg, NULL,  0);	break;
+	    	txchn_rfcfg->lol_tcal = strtoul(optarg, NULL,  0);		break;
 		case 'v': g_m_verbo = strtoul(optarg, NULL,  0);			break;
 		default : usage(); exit(EXIT_FAILURE);						break;
 		}
@@ -159,8 +146,6 @@ static void get_args(int argc, char **argv)
 /* cleanup and exit */
 static void shutdown(void)
 {
-	if (g_m_verbo > 0)
-		printf("* Destroying context\r\n");
 	if (NULL != ctx) {
 		iio_context_destroy(ctx);
 		ctx = NULL;
@@ -174,64 +159,6 @@ static void handle_sig(int sig)
 	printf("\r\nWaiting for process to finish...\r\n");
 	stop = 1;
 }
-
-#if 0
-/* check return value of attr_write function */
-static void errchk(int v, const char* what)
-{
-	if (v < 0) {
-		fprintf(stderr, "Error %d writing to channel \"%s\""
-			"\r\nvalue may not be supported.\r\n", v, what);
-		exit(0);
-	}
-}
-
-/* write attribute: long long int */
-static void wr_ch_lli(struct iio_channel *chn, const char* what, long long val)
-{
-	errchk(iio_channel_attr_write_longlong(chn, what, val), what);
-}
-
-/* write attribute: long long int */
-static long long rd_ch_lli(struct iio_channel *chn, const char* what)
-{
-	long long val;
-
-	errchk(iio_channel_attr_read_longlong(chn, what, &val), what);
-	printf("\t %s: %lld\r\n", what, val);
-	return val;
-}
-
-#if 0
-/* write attribute: string */
-static void wr_ch_str(struct iio_channel *chn, const char* what, const char* str)
-{
-	errchk(iio_channel_attr_write(chn, what, str), what);
-}
-#endif
-
-/* helper function generating channel names */
-static char *get_chn_name(const char* type, int id, char modify)
-{
-	if ('\0' == modify)
-		snprintf(tmpstr, sizeof(tmpstr), "%s%d", type, id);
-	else
-		snprintf(tmpstr, sizeof(tmpstr), "%s%d_%c", type, id, modify);
-	return tmpstr;
-}
-
-/* helper function to check return value of attr_write function */
-/* int chn, const char* type_string, const char* what, type_key value */
-#define IIO_ATTR(A, C, T, W, V) \
-do {\
-	int ret;\
-	ret = iio_channel_attr_##A_##T(C, W, V);\
-	if (ret < 0) {\
-		fprintf(stderr, "Error %d "#A" to channel \"%s\"\r\n", W);\
-		abort();\
-	}\
-} while (0);
-#endif
 
 /* finds rfic IIO devices */
 static struct iio_device *get_phy_dev(struct iio_context *ctx, int ig)
@@ -248,11 +175,10 @@ static struct iio_device *get_phy_dev(struct iio_context *ctx, int ig)
 	if (ig == 0) {
 		dev = iio_context_find_device(ctx, devname_phy);
 	} else {
-		char tmpstr[64];
 		sscanf(tmpstr, "%s-n%d", devname_phy, ig+1);
 		dev = iio_context_find_device(ctx, tmpstr);
 	}
-	ASSERT((NULL != dev) && "the specified iio device not found");
+	ASSERT((NULL != dev) && "iio device not found");
 	return dev;
 }
 
@@ -260,50 +186,50 @@ static struct iio_device *get_phy_dev(struct iio_context *ctx, int ig)
 /* ad9371-phy(iio:device1) */
 	/* PHY_RX[0/1] (iio:device1/ in_voltage[0/1] */
 	/* PHY_TX[0/1] (iio:device1/out_voltage[0/1] */
-static struct iio_channel *get_phy_chn_rf(struct iio_device *phy, enum iopath p, int ic)
+static struct iio_channel *get_phy_chn_rf(struct iio_device *phy, enum iopath p, int ip)
 {
 	struct iio_channel *chn;
 
-	chn = iio_device_find_channel(phy, get_chn_name("voltage", ic, '\0'), p == TX);
-	ASSERT((NULL != chn) && "get_phy_chn_rf: No channel found");
+	chn = iio_device_find_channel(phy, GET_CHN_NAME("voltage", ip, '\0'), p == TX);
+	ASSERT((NULL != chn) && "No channel found");
 	if (g_m_verbo > 0)
         printf("* Acquiring PHY channel %s\r\n", iio_channel_get_name(chn));
 	return chn;
 }
 
-static bool dmp_phy_chn_rf(struct iio_channel *chn, enum iopath p, struct phy_cfg *cfg)
+static bool dmp_phy_chn_rf(struct iio_channel *chn, enum iopath p, struct rfcfg *cfg)
 {
 	int ret;
 
-	iio_channel_attr_read_bool(chn, "powerdown", &cfg->powerdown);
-	iio_channel_attr_read_longlong(chn, "rf_bandwidth", &cfg->bw_hz);
-	iio_channel_attr_read_longlong(chn, "sampling_frequency", &cfg->fs_hz);
-	iio_channel_attr_read_double(chn, "hardwaregain", &cfg->gain);
-    iio_channel_attr_read_bool(chn, "quadrature_tracking_en", &cfg->qtracking);
-	if (TX == path)
-		iio_channel_attr_write_bool(chn, "lo_leakage_tracking_en", &cfg->lol_tcal);
+	R_CHN_BOO(chn, "powerdown", &cfg->pwrdown);
+	R_CHN_LLI(chn, "rf_bandwidth", &cfg->bw_hz);
+	R_CHN_LLI(chn, "sampling_frequency", &cfg->fs_hz);
+	R_CHN_DBL(chn, "hardwaregain", &cfg->gain);
+    R_CHN_BOO(chn, "quadrature_tracking_en", &cfg->qec_tcal);
+	if (TX == p)
+		R_CHN_BOO(chn, "lo_leakage_tracking_en", &cfg->lol_tcal);
 
 	return true;
 }
 
-static bool cfg_phy_chn_rf(struct iio_channel *chn, enum iopath p, struct phy_cfg *cfg)
+static bool cfg_phy_chn_rf(struct iio_channel *chn, enum iopath p, struct rfcfg *cfg)
 {
 	int ret;
-#if 0
-	iio_channel_attr_write_bool(chn, "powerdown", false);
-	iio_channel_attr_write_longlong(chn, "rf_bandwidth", cfg->bw_hz);
-	iio_channel_attr_write_longlong(chn, "sampling_frequency", cfg->fs_hz);
-	iio_channel_attr_write_double(chn, "hardwaregain", cfg->gain);
-	iio_channel_attr_write_bool(chn, "quadrature_tracking_en", cfg->qtracking);
-	if (TX == path)
-		iio_channel_attr_write_bool(chn, "lo_leakage_tracking_en", cfg->lol_tcal);
+#if 1
+	W_CHN_BOO(chn, "powerdown", false);
+	W_CHN_LLI(chn, "rf_bandwidth", cfg->bw_hz);
+	W_CHN_LLI(chn, "sampling_frequency", cfg->fs_hz);
+	wr_ch_dbl(chn, "hardwaregain", cfg->gain);
+	W_CHN_BOO(chn, "quadrature_tracking_en", cfg->qec_tcal);
+	if (TX == p)
+		W_CHN_BOO(chn, "lo_leakage_tracking_en", cfg->lol_tcal);
 #else
-	IIO_ATTR(chn, "powerdown", false);
+	IIO_ATTR(chn, "powerdown", write, bool, false);
 	IIO_ATTR(chn, "rf_bandwidth", write, longlong, cfg->bw_hz);
 	IIO_ATTR(chn, "sampling_frequency", write, longlong, cfg->fs_hz);
 	IIO_ATTR(chn, "hardwaregain", write, double, cfg->gain);
-	if (TX == path)
-		IIO_ATTR(chn, "lo_leakage_tracking_en", write, bool, cfg->qtracking);
+	if (TX == p)
+		IIO_ATTR(chn, "lo_leakage_tracking_en", write, bool, cfg->qec_tcal);
 #endif
 
 	return true;
@@ -316,75 +242,65 @@ static struct iio_channel *get_phy_chn_lo(struct iio_device *phy, enum iopath p)
 
 	if (g_m_verbo > 0)
 		printf("* Acquiring device 'PHY' lo-channel '%s'\r\n", p == TX ? "TX" : "RX");
-	switch (path) {
-	case RX:
-		chn = iio_device_find_channel(phy, get_chn_name("altvoltage", 0, '\0'), true);
-	case TX:
-		chn = iio_device_find_channel(phy, get_chn_name("altvoltage", 1, '\0'), true);
-	case OR:
-		chn = iio_device_find_channel(phy, get_chn_name("altvoltage", 2, '\0'), true);
-	default:
-		ASSERT(0);
-		return NULL;
-	}
-	ASSERT((NULL != chn) && "get_phy_chn_lo: No channel found");
+	chn = iio_device_find_channel(phy, GET_CHN_NAME("altvoltage", p, '\0'), true);
+	ASSERT((NULL != chn) && "No channel found");
 	return chn;
 }
 
-static bool dmp_phy_chn_lo(struct iio_channel *chn, enum iopath p, struct phy_cfg *cfg)
+static bool dmp_phy_chn_lo(struct iio_channel *chn, enum iopath p, struct rfcfg *cfg)
 {
 	int ret;
 
-    switch (path) {
+    switch (p) {
 	case RX:
 #if 0
-        iio_channel_attr_read_longlong(chn, "RX_LO_frequency", &cfg->lo_hz);
+        R_CHN_LLI(chn, "RX_LO_frequency", &cfg->lo_hz);
 #else
-        iio_channel_attr_read_longlong(chn, "frequency", &cfg->lo_hz);
+        R_CHN_LLI(chn, "frequency", &cfg->lo_hz);
 #endif
 		break;
 	case TX:
 #if 0
-		iio_channel_attr_read_longlong(chn, "TX_LO_frequency", &cfg->lo_hz);
+		R_CHN_LLI(chn, "TX_LO_frequency", &cfg->lo_hz);
 #else
-        iio_channel_attr_read_longlong(chn, "frequency", &cfg->lo_hz);
+        R_CHN_LLI(chn, "frequency", &cfg->lo_hz);
 #endif
 		break;
 	case OR:
 #if 0
         //chn = iio_device_find_channel(phy, chnname("altvoltage", 2), true);
-        iio_channel_attr_read_longlong(chn, "RX_SN_LO_frequency", &cfg->lo_hz);
+        R_CHN_LLI(chn, "RX_SN_LO_frequency", &cfg->lo_hz);
 #else
-        iio_channel_attr_read_longlong(chn, "frequency", &cfg->lo_hz);
+        R_CHN_LLI(chn, "frequency", &cfg->lo_hz);
 #endif
 		break;
 	}
 }
 
-static bool cfg_phy_chn_lo(struct iio_channel *chn, enum iopath p, struct phy_cfg *cfg)
+static bool cfg_phy_chn_lo(struct iio_channel *chn, enum iopath p, struct rfcfg *cfg)
 {
 	int ret;
-    switch (path) {
+    switch (p) {
 	case RX:
 #if 0
-        iio_channel_attr_write_longlong(chn, "RX_LO_frequency", cfg->lo_hz);
+        W_CHN_LLI(chn, "RX_LO_frequency", cfg->lo_hz);
 #else
-        iio_channel_attr_write_longlong(chn, "frequency", cfg->lo_hz);
+        W_CHN_LLI(chn, "frequency", cfg->lo_hz);
 #endif
 		break;
 	case TX:
 #if 0
-		iio_channel_attr_write_longlong(chn, "TX_LO_frequency", cfg->lo_hz);
+		W_CHN_LLI(chn, "TX_LO_frequency", cfg->lo_hz);
 #else
-        iio_channel_attr_write_longlong(chn, "frequency", cfg->lo_hz);
+        W_CHN_LLI(chn, "frequency", cfg->lo_hz);
 #endif
 		break;
 	case OR:
 #if 0
         //chn = iio_device_find_channel(phy, chnname("altvoltage", 2), true);
-        iio_channel_attr_write_longlong(chn, "RX_SN_LO_frequency", cfg->lo_hz);
+        W_CHN_LLI(chn, "RX_SN_LO_frequency", cfg->lo_hz);
 #else
-        iio_channel_attr_write_longlong(chn, "frequency", cfg->lo_hz);
+        W_CHN_LLI(chn, "frequency", cfg->lo_hz);
 #endif
 		break;
 	}
@@ -394,20 +310,14 @@ static void dmp_phy_dbg(struct iio_device *phy)
 {
     long long val;
 
-	iio_device_debug_attr_write_longlong(phy[i],"adi,tx-settings-tx-pll-lo-frequency_hz", cfg->tx_freq);
-	iio_device_debug_attr_write_longlong(phy[i],"adi,rx-settings-rx-pll-lo-frequency_hz", cfg->rx_freq);
-	iio_device_debug_attr_read_longlong (phy[i],"adi,tx-settings-tx-pll-lo-frequency_hz", &tempvar1);
-	iio_device_debug_attr_read_longlong (phy[i],"adi,rx-settings-rx-pll-lo-frequency_hz", &val);
-	printf("Tx frequency is %lld, Rx frequency is %lld\r\n",tempvar1, val);
-	
-	iio_device_debug_attr_read_longlong (phy[i],"adi,tx-settings-tx1-atten_mdb", &tempvar1);
-	iio_device_debug_attr_read_longlong (phy[i],"adi,tx-settings-tx2-atten_mdb", &val);
-	printf("tx1_atten is %lld, tx2_atten is %lld\r\n",tempvar1, val);
-	
-	iio_device_debug_attr_read_longlong (phy[i],"adi,tx-profile-iq-rate_khz", &tempvar1);
-	iio_device_debug_attr_read_longlong (phy[i],"adi,rx-profile-iq-rate_khz", &val);
-	printf("tx sample rate is %lld, rx sample rate is %lld\r\n",tempvar1, val);
-
+	W_DBG_LLI(phy[i],"adi,tx-settings-tx-pll-lo-frequency_hz", &val);
+	W_DBG_LLI(phy[i],"adi,rx-settings-rx-pll-lo-frequency_hz", &val);
+	R_DBG_LLI(phy[i],"adi,tx-settings-tx-pll-lo-frequency_hz", &val);
+	R_DBG_LLI(phy[i],"adi,rx-settings-rx-pll-lo-frequency_hz", &val);
+	R_DBG_LLI(phy[i],"adi,tx-settings-tx1-atten_mdb", &val);
+	R_DBG_LLI(phy[i],"adi,tx-settings-tx2-atten_mdb", &val);
+	R_DBG_LLI(phy[i],"adi,tx-profile-iq-rate_khz", &val);
+	R_DBG_LLI(phy[i],"adi,rx-profile-iq-rate_khz", &val);
 }
 
 
@@ -428,83 +338,88 @@ static void profile_phy_array(struct iio_device *phy)
 {
 #if 0
     mykonosTxSettings_t *tx = mykDevice.tx;
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx-channels-enable",	tx->txChannels);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx-pll-use-external-lo", tx->txPllUseExternalLo);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx-pll-lo-frequency_hz", tx->txPllLoFrequency_Hz);
-    iio_device_debug_attr_write_longlong(phy, "adi,adi,tx-settings-tx-atten-step-size", tx->txAttenStepSize);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx2-atten_mdb", tx->tx2Atten_mdB);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx1-atten_mdb", tx->tx1Atten_mdB);
+    W_DBG_LLI(phy, "adi,tx-settings-tx-channels-enable",	tx->txChannels);
+    W_DBG_LLI(phy, "adi,tx-settings-tx-pll-use-external-lo", tx->txPllUseExternalLo);
+    W_DBG_LLI(phy, "adi,tx-settings-tx-pll-lo-frequency_hz", tx->txPllLoFrequency_Hz);
+    W_DBG_LLI(phy, "adi,adi,tx-settings-tx-atten-step-size", tx->txAttenStepSize);
+    W_DBG_LLI(phy, "adi,tx-settings-tx2-atten_mdb", tx->tx2Atten_mdB);
+    W_DBG_LLI(phy, "adi,tx-settings-tx1-atten_mdb", tx->tx1Atten_mdB);
 
     mykonosTxProfile_t *tp = mykDevice.tx->txProfile;
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-tx-bbf-3db-corner_khz", tp->txBbf3dBCorner_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-tx-dac-3db-corner_khz", tp->txDac3dBCorner_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-rf-bandwidth_hz", tp->rfBandwidth_Hz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-primary-sig-bandwidth_hz", tp->primarySigBandwidth_Hz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-iq-rate_khz", tp->iqRate_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-tx-input-hb-interpolation", tp->txInputHbInterpolation);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-thb2-interpolation", tp->thb1Interpolation);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-thb1-interpolation", tp->thb2Interpolation);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-tx-fir-interpolation", tp->txFirInterpolation);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-dac-div", tp->dacDiv);
+    W_DBG_LLI(phy, "adi,tx-profile-tx-bbf-3db-corner_khz", tp->txBbf3dBCorner_kHz);
+    W_DBG_LLI(phy, "adi,tx-profile-tx-dac-3db-corner_khz", tp->txDac3dBCorner_kHz);
+    W_DBG_LLI(phy, "adi,tx-profile-rf-bandwidth_hz", tp->rfBandwidth_Hz);
+    W_DBG_LLI(phy, "adi,tx-profile-primary-sig-bandwidth_hz", tp->primarySigBandwidth_Hz);
+    W_DBG_LLI(phy, "adi,tx-profile-iq-rate_khz", tp->iqRate_kHz);
+    W_DBG_LLI(phy, "adi,tx-profile-tx-input-hb-interpolation", tp->txInputHbInterpolation);
+    W_DBG_LLI(phy, "adi,tx-profile-thb2-interpolation", tp->thb1Interpolation);
+    W_DBG_LLI(phy, "adi,tx-profile-thb1-interpolation", tp->thb2Interpolation);
+    W_DBG_LLI(phy, "adi,tx-profile-tx-fir-interpolation", tp->txFirInterpolation);
+    W_DBG_LLI(phy, "adi,tx-profile-dac-div", tp->dacDiv);
 
 	mykonosRxSettings_t *rx = mykDevice.rx;
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-settings-rx-pll-lo-frequency_hz", rx->rxPllLoFrequency_Hz);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-settings-rx-pll-use-external-lo", rx->rxPllUseExternalLo);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-settings-rx-channels-enable", rx->rxChannels);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-settings-real-if-data", rx->realIfData);
+    W_DBG_LLI(phy, "adi,rx-settings-rx-pll-lo-frequency_hz", rx->rxPllLoFrequency_Hz);
+    W_DBG_LLI(phy, "adi,rx-settings-rx-pll-use-external-lo", rx->rxPllUseExternalLo);
+    W_DBG_LLI(phy, "adi,rx-settings-rx-channels-enable", rx->rxChannels);
+    W_DBG_LLI(phy, "adi,rx-settings-real-if-data", rx->realIfData);
 
     mykonosRxProfile_t *rp = mykDevice.rx->rxProfile;
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rx-bbf-3db-corner_khz", rp->rxBbf3dBCorner_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rf-bandwidth_hz", rp->rfBandwidth_Hz);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-iq-rate_khz", rp->iqRate_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rhb1-decimation", rp->rhb1Decimation);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-en-high-rej-dec5", rp->enHighRejDec5);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rx-dec5-decimation", rp->rxDec5Decimation);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rx-fir-decimation", rp->rxFirDecimation);
+    W_DBG_LLI(phy, "adi,rx-profile-rx-bbf-3db-corner_khz", rp->rxBbf3dBCorner_kHz);
+    W_DBG_LLI(phy, "adi,rx-profile-rf-bandwidth_hz", rp->rfBandwidth_Hz);
+    W_DBG_LLI(phy, "adi,rx-profile-iq-rate_khz", rp->iqRate_kHz);
+    W_DBG_LLI(phy, "adi,rx-profile-rhb1-decimation", rp->rhb1Decimation);
+    W_DBG_LLI(phy, "adi,rx-profile-en-high-rej-dec5", rp->enHighRejDec5);
+    W_DBG_LLI(phy, "adi,rx-profile-rx-dec5-decimation", rp->rxDec5Decimation);
+    W_DBG_LLI(phy, "adi,rx-profile-rx-fir-decimation", rp->rxFirDecimation);
 #else
     taliseTxSettings_t *tx = talInit.tx;
 
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx-channels-enable", tx->txChannels);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx-data-options-if-pll-unlock", tx->disTxDataIfPllUnlock);
-    //iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx-pll-lo-frequency_hz", tx->txPllLoFrequency_Hz);
-    iio_device_debug_attr_write_longlong(phy, "adi,adi,tx-settings-deframer-sel", tx->deframerSel); 
-    iio_device_debug_attr_write_longlong(phy, "adi,adi,tx-settings-tx-atten-step-size", tx->txAttenStepSize);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx2-atten_mdb", tx->tx2Atten_mdB);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-settings-tx1-atten_mdb", tx->tx1Atten_mdB);
+    W_DBG_LLI(phy, "adi,tx-settings-tx-channels-enable", tx->txChannels);
+    W_DBG_LLI(phy, "adi,tx-settings-tx-data-options-if-pll-unlock", tx->disTxDataIfPllUnlock);
+    //W_DBG_LLI(phy, "adi,tx-settings-tx-pll-lo-frequency_hz", tx->txPllLoFrequency_Hz);
+    W_DBG_LLI(phy, "adi,adi,tx-settings-deframer-sel", tx->deframerSel); 
+    W_DBG_LLI(phy, "adi,adi,tx-settings-tx-atten-step-size", tx->txAttenStepSize);
+    W_DBG_LLI(phy, "adi,tx-settings-tx2-atten_mdb", tx->tx2Atten_mdB);
+    W_DBG_LLI(phy, "adi,tx-settings-tx1-atten_mdb", tx->tx1Atten_mdB);
 
     taliseTxProfile_t *tp = tx->txProfile;
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-tx-bbf-3db-corner_khz", tp->txBbf3dBCorner_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-tx-dac-3db-corner_khz", tp->txDac3dBCorner_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-rf-bandwidth_hz", tp->rfBandwidth_Hz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-primary-sig-bandwidth_hz", tp->primarySigBandwidth_Hz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-tx-input-rate_khz", tp->txInputRate_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-tx-int5-interpolation", tp->txInt5Interpolation);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-thb1-interpolation", tp->thb1Interpolation);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-thb2-interpolation", tp->thb2Interpolation);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-thb3-interpolation", tp->thb3Interpolation);
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-tx-fir-interpolation", tp->txFirInterpolation); 
-    iio_device_debug_attr_write_longlong(phy, "adi,tx-profile-dac-div", tp->dacDiv);
+    W_DBG_LLI(phy, "adi,tx-profile-tx-bbf-3db-corner_khz", tp->txBbf3dBCorner_kHz);
+    W_DBG_LLI(phy, "adi,tx-profile-tx-dac-3db-corner_khz", tp->txDac3dBCorner_kHz);
+    W_DBG_LLI(phy, "adi,tx-profile-rf-bandwidth_hz", tp->rfBandwidth_Hz);
+    W_DBG_LLI(phy, "adi,tx-profile-primary-sig-bandwidth_hz", tp->primarySigBandwidth_Hz);
+    W_DBG_LLI(phy, "adi,tx-profile-tx-input-rate_khz", tp->txInputRate_kHz);
+    W_DBG_LLI(phy, "adi,tx-profile-tx-int5-interpolation", tp->txInt5Interpolation);
+    W_DBG_LLI(phy, "adi,tx-profile-thb1-interpolation", tp->thb1Interpolation);
+    W_DBG_LLI(phy, "adi,tx-profile-thb2-interpolation", tp->thb2Interpolation);
+    W_DBG_LLI(phy, "adi,tx-profile-thb3-interpolation", tp->thb3Interpolation);
+    W_DBG_LLI(phy, "adi,tx-profile-tx-fir-interpolation", tp->txFirInterpolation); 
+    W_DBG_LLI(phy, "adi,tx-profile-dac-div", tp->dacDiv);
 
     taliseRxSettings_t *rxs = talInit.rx;
-    //iio_device_debug_attr_write_longlong(phy, "adi,rx-settings-rx-pll-lo-frequency_hz", rx->rxPllLoFrequency_Hz);
-    //iio_device_debug_attr_write_longlong(phy, "adi,rx-settings-rx-pll-use-external-lo", rx->rxPllUseExternalLo);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-settings-rx-channels-enable", rx->rxChannels);
-    //iio_device_debug_attr_write_longlong(phy, "adi,rx-settings-real-if-data", rx->realIfData);
-    iio_device_debug_attr_write_longlong(phy, "adi,adi,rx-settings-framer-sel", rx->framerSel);
+    //W_DBG_LLI(phy, "adi,rx-settings-rx-pll-lo-frequency_hz", rx->rxPllLoFrequency_Hz);
+    //W_DBG_LLI(phy, "adi,rx-settings-rx-pll-use-external-lo", rx->rxPllUseExternalLo);
+    W_DBG_LLI(phy, "adi,rx-settings-rx-channels-enable", rx->rxChannels);
+    //W_DBG_LLI(phy, "adi,rx-settings-real-if-data", rx->realIfData);
+    W_DBG_LLI(phy, "adi,adi,rx-settings-framer-sel", rx->framerSel);
 
     taliseRxProfile_t *rp = &rx->rxProfile;
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rx-bbf-3db-corner_khz", rp->rxBbf3dBCorner_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rf-bandwidth_hz", rp->rfBandwidth_Hz);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rx-output-rate_khz", rp->rxOutputRate_kHz);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rhb1-decimation", rp->rhb1Decimation);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rx-dec5-decimation", rp->rxDec5Decimation);
-    iio_device_debug_attr_write_longlong(phy, "adi,rx-profile-rx-fir-decimation", rp->rxFirDecimation);
+    W_DBG_LLI(phy, "adi,rx-profile-rx-bbf-3db-corner_khz", rp->rxBbf3dBCorner_kHz);
+    W_DBG_LLI(phy, "adi,rx-profile-rf-bandwidth_hz", rp->rfBandwidth_Hz);
+    W_DBG_LLI(phy, "adi,rx-profile-rx-output-rate_khz", rp->rxOutputRate_kHz);
+    W_DBG_LLI(phy, "adi,rx-profile-rhb1-decimation", rp->rhb1Decimation);
+    W_DBG_LLI(phy, "adi,rx-profile-rx-dec5-decimation", rp->rxDec5Decimation);
+    W_DBG_LLI(phy, "adi,rx-profile-rx-fir-decimation", rp->rxFirDecimation);
 #endif
     printf("%s finished\r\n", __func__);
 }
 
 static void profile_phy_file(struct iio_context *ctx, struct iio_device *phy, const char *fn)
 {
+	int ret;
+	FILE *fd;
+	char *buf;
+	size_t len;
+
     printf("Load profile from %s\r\n", fn);
     FILE *fd = fopen(fn, "r");
     if (!fd) {
@@ -513,9 +428,9 @@ static void profile_phy_file(struct iio_context *ctx, struct iio_device *phy, co
     }
 
 	fseek(fd, 0, SEEK_END);
-    size_t len = ftell(fd);
+    len = ftell(fd);
 	//printf("the profile's length is:%d\r\n", (int)len);
-    char *buf = malloc(len);
+    buf = malloc(len);
 	if (NULL == buf) {
 		perror("malloc");
 		exit(-1);
@@ -542,33 +457,42 @@ static void profile_phy_file(struct iio_context *ctx, struct iio_device *phy, co
 
 int init_phy(int ig)
 {
-    if (g_m_verbo > 0)
-        printf("init_phy(g%d): Acquiring PHY device\r\n", ig);
-	rfdev[ig] = get_phy_dev(ctx, ig);
-	ASSERT((ret > 0) && "No devices");
-    if (g_m_verbo > 0)
-        printf("init_phy(g%d): Profiling PHY device\r\n", ig);
-    profile_phy_array(phy);
+	int ip;
+	struct iio_channel *chn;
 
-	for (ic=0; ic<DEV_CHN_NB; ic++) {
-		if (g_pth_msk & EN_IIO_PATH_RX) {
-	        if (g_m_verbo > 0)
-                printf("RX(g%dc%): Initializing channels of PHY device\r\n", ig, ic);
-			chn = get_phy_chn_rf(rfdev[ig], RX, ic);
+    if (g_m_verbo > 2) printf("'PHY%d' acquiring ... ", ig);
+	rfdev[ig] = get_phy_dev(ctx, ig);
+	ASSERT((NULL != rfdev[ig]) && "No devices");
+    if (g_m_verbo > 2) printf("succeed\r\n");
+
+    if (g_m_verbo > 2) printf("'PHY%d' profiling ... ", ig);
+    profile_phy_array(rfdev[ig]);
+    if (g_m_verbo > 2) printf("succeed\r\n");
+
+	if (g_pth_msk & EN_IIO_PATH_RX) {
+		if (g_m_verbo > 2) printf("'PHY%d' Init RX i/q channels of port%d ... ", ig, ip);
+		for (ip=0; ip<DEV_PORT_NB; ip++) {
+			chn = get_phy_chn_rf(rfdev[ig], RX, ip);
+			ASSERT((NULL != chn) && "'PHY': No RF-RX channel found");
 			cfg_phy_chn_rf(chn, RX, &rxchn_rfcfg);
 			chn = get_phy_chn_lo(rfdev[ig], RX);
+			ASSERT((NULL != chn) && "'PHY': No LO-RX channel found");
 			cfg_phy_chn_lo(chn, RX, &rxchn_rfcfg);
-			ASSERT(ret && "No phy_rxport found");
 		}
-		if ((g_pth_msk & EN_IIO_PATH_TX)) {
-	        if (g_m_verbo > 0)
-                printf("TX(g%dc%): Initializing channels of PHY device\r\n", ig, ic);
-			chn = get_phy_chn_rf(rfdev[ig], TX, ic);
+		if (g_m_verbo > 2) printf("succeed\r\n");
+	}
+
+	if ((g_pth_msk & EN_IIO_PATH_TX)) {
+		if (g_m_verbo > 2) printf("'PHY%d' Init TX i/q channels of port%d ... ", ig, ip);
+		for (ip=0; ip<DEV_PORT_NB; ip++) {
+			chn = get_phy_chn_rf(rfdev[ig], TX, ip);
+			ASSERT((NULL != chn) && "'PHY': No RF-TX channel found");
 			cfg_phy_chn_rf(chn, TX, &txchn_rfcfg);
 			chn = get_phy_chn_lo(rfdev[ig], TX);
+			ASSERT((NULL != chn) && "'PHY': No LO-TX channel found");
 			cfg_phy_chn_lo(chn, TX, &txchn_rfcfg);
-			ASSERT(ret && "No phy_rxport found");
 		}
+		if (g_m_verbo > 2) printf("succeed\r\n");
 	}
 }
 
@@ -578,12 +502,11 @@ int main(int argc, char *argv[])
 	int ig;
 
     if (NULL == ctx) {
-        if (g_m_verbo > 0)
-            printf("* Acquiring IIO context\r\n");
 		ctx = iio_create_local_context();
-    	ASSERT((NULL != ctx) && "No context");
+    	ASSERT((NULL != ctx) && "context-local failed");
+
 		ret = iio_context_get_devices_count(ctx);
-    	ASSERT((ret > 0) && "No devices");
+    	ASSERT((ret > 0) && "No iio-devices found");
     }
 
 	get_args(argc, argv);

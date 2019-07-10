@@ -34,7 +34,7 @@
 
 #define ASSERT(expr) { \
 	if (!(expr)) { \
-		(void) fprintf(stderr, "assertion failed (%s:%d)\n", __FILE__, __LINE__); \
+		(void) fprintf(stderr, "ASSERT_FAIL:L%d:%s()\n", __func__, __LINE__); \
 		(void) abort(); \
 	} \
 }

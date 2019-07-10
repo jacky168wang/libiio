@@ -1,6 +1,6 @@
 /*
  * applications based on libiio
- *   - AD9371 IIO streaming example
+ *   - RFIC IIO streaming example
  *
  * Copyright (C) 2018~2020 FACC Inc.
  * Author: Jacky Wang <kenwj@sina.com>
@@ -27,49 +27,56 @@
 #include <iio.h>
 #endif
 #include "common_jacky.h"
-#include "rru_bbu.h"
+#include "common_libiio.h"
+//#include "rru_bbu.h"
+
+/*
+------------------------------------------------------------------------------*/
 
 /* IIO structs required for streaming */
 static struct iio_context *ctx;
+
 // Streaming devices
+static struct iio_device *iio_rxdev[TOT_CHIP_NB];
+static struct iio_device *iio_txdev[TOT_CHIP_NB];
 static struct iio_device *ordev[TOT_CHIP_NB];
-static struct iio_device *txdev[TOT_CHIP_NB];
-static struct iio_device *rxdev[TOT_CHIP_NB];
+
 // one libiio buffer for each device
-       struct iio_buffer *iio_orbuf[TOT_CHIP_NB];
-       struct iio_buffer *iio_txbuf[TOT_CHIP_NB];
        struct iio_buffer *iio_rxbuf[TOT_CHIP_NB];
+       struct iio_buffer *iio_txbuf[TOT_CHIP_NB];
+       struct iio_buffer *iio_orbuf[TOT_CHIP_NB];
+
 // sample counters per device
 static size_t orsnb[TOT_CHIP_NB];
 static size_t rxsnb[TOT_CHIP_NB];
 static size_t txsnb[TOT_CHIP_NB];
-// 2x2 Streaming channels (2 Streaming channels) for each device
-struct iio_channel *iio_rxchi[TOT_CHN_NB];
-struct iio_channel *iio_rxchq[TOT_CHN_NB];
-struct iio_channel *iio_txchi[TOT_CHN_NB];
-struct iio_channel *iio_txchq[TOT_CHN_NB];
 
-/* RX is input, TX is output */
-enum iopath { RX, TX, OR };
-static const char *str_path[] = {
-	"RX", "TX", "OR"
-};
-#define EN_IIO_PATH_RX (1 << RX)
-#define EN_IIO_PATH_TX (1 << TX)
+// 2x2 Streaming channels (2 Streaming ports) for each device
+struct iio_channel *iiopr_chni[TOT_PORT_NB];
+struct iio_channel *iiopr_chnq[TOT_PORT_NB];
+struct iio_channel *iiopt_chni[TOT_PORT_NB];
+struct iio_channel *iiopt_chnq[TOT_PORT_NB];
+
+/*
+------------------------------------------------------------------------------*/
+
+#define EN_IIO_PATH_RX BIT(RX)
+#define EN_IIO_PATH_TX BIT(TX)
        unsigned int g_pth_msk = EN_IIO_PATH_TX | EN_IIO_PATH_RX;
 static unsigned int g_m_verbo = 0;
-//#define BIT(n) (1 << n)
-static unsigned int g_chn_msk = BIT(0); // 2T2R
-//static unsigned int g_chn_msk = BIT(0) | BIT(1); // 4T4R
-//static unsigned int g_chn_msk = BIT(0) | BIT(1) | BIT(2) | BIT(3); // 8T8R
+
+static unsigned int g_prt_msk = BIT(0); // 2T2R
+//static unsigned int g_prt_msk = BIT(0) | BIT(1); // 4T4R
+//static unsigned int g_prt_msk = BIT(0) | BIT(1) | BIT(2) | BIT(3); // 8T8R
 
 static unsigned int g_rsmp_nb = IIOPR_SMP_NB_NOW;
 static unsigned int g_dst_way = 0;
-static unsigned int g_tsmp_nb = IIOPT_SMP_NB_NOW;
-static unsigned int g_pattern = 0xffff;
-static unsigned int g_src_way = 0;
-static int wfd, rfd;
+static FILE *g_wfd[TOT_PORT_NB];
 
+static unsigned int g_tsmp_nb = IIOPT_SMP_NB_NOW;
+static unsigned int g_word_pn = 0xffff;
+static unsigned int g_src_way = 0;
+static FILE *g_rfd[TOT_PORT_NB];
 
 static void usage(void)
 {
@@ -120,14 +127,14 @@ unsigned long int strtoul(const char *nptr, char **endptr, int base);
 static void get_args(int argc, char **argv)
 {
 	int c;
-	while ((c = getopt(argc, argv, "x:c:m:d:n:p:s:v:h")) != EOF) {
+	while ((c = getopt(argc, argv, "x:p:m:d:n:p:s:v:h")) != EOF) {
 		switch (c) {
 		case 'x': g_pth_msk = strtoul(optarg, NULL, 16);			break;
-		case 'c': g_chn_msk = strtoul(optarg, NULL, 16);			break;
+		case 'p': g_prt_msk = strtoul(optarg, NULL, 16);			break;
 		case 'm': g_rsmp_nb = strtoul(optarg, NULL,  0);			break;
 		case 'd': g_dst_way = strtoul(optarg, NULL,  0);			break;
 		case 'n': g_tsmp_nb = strtoul(optarg, NULL,  0);			break;
-		case 'p': g_pattern = strtoul(optarg, NULL, 16);			break;
+		case 'w': g_word_pn = strtoul(optarg, NULL, 16);			break;
 		case 's': g_src_way = strtoul(optarg, NULL,  0);			break;
 		case 'v': g_m_verbo = strtoul(optarg, NULL,  0);			break;
 		default : usage(); exit(EXIT_FAILURE);						break;
@@ -147,106 +154,23 @@ static void get_args(int argc, char **argv)
 	printf( "CURRENT SETTINGS:\r\n" );
 	printf( "g_m_verbo(-v):   %u\r\n", g_m_verbo );
 	printf( "g_pth_msk(-x):   %u\r\n", g_pth_msk );
-	printf( "g_chn_msk(-x):   %u\r\n", g_chn_msk );
+	printf( "g_prt_msk(-x):   %u\r\n", g_prt_msk );
 	printf( "g_rsmp_nb(-m):   %u\r\n", g_rsmp_nb );
 	printf( "g_dst_way(-d):   %u\r\n", g_dst_way );
 	printf( "g_tsmp_nb(-n):   %u\r\n", g_tsmp_nb );
-	printf( "g_pattern(-p):   %u\r\n", g_pattern );
+	printf( "g_word_pn(-p):   %u\r\n", g_word_pn );
 	printf( "g_src_way(-s):   %u\r\n", g_src_way );
 	printf( "\r\n" );
 }
 
-/* cleanup and exit */
-static void shutdown(void)
-{
-	int ic, ig;
-
-	if (g_m_verbo > 0)
-		printf("* Destroying iio-buffers\r\n");
-	for (ig = 0; ig < TOT_CHIP_NB; ig++) {
-		if (iio_txbuf[ig]) iio_buffer_destroy(iio_txbuf[ig]);
-		if (iio_rxbuf[ig]) iio_buffer_destroy(iio_rxbuf[ig]);
-
-		if (g_m_verbo > 0)
-			printf("* Disabling streaming channels\r\n");
-		for (ic = 0; ic < TOT_CHN_NB; ic++) {
-			if (iio_rxchi[ic]) iio_channel_disable(iio_rxchi[ic]);
-			if (iio_rxchq[ic]) iio_channel_disable(iio_rxchq[ic]);
-			if (iio_txchi[ic]) iio_channel_disable(iio_txchi[ic]);
-			if (iio_txchq[ic]) iio_channel_disable(iio_txchq[ic]);
-		}
-	}
-
-	if (g_m_verbo > 0)
-		printf("* Destroying context\r\n");
-	if (ctx) iio_context_destroy(ctx);
-	exit(0);
-}
-
+/*
+------------------------------------------------------------------------------*/
 static volatile sig_atomic_t stop = 0;
 static void handle_sig(int sig)
 {
 	printf("\r\nWaiting for process to finish...\r\n");
 	stop = 1;
 }
-
-#if 0
-/* check return value of attr_write function */
-static void errchk(int v, const char* what)
-{
-	if (v < 0) {
-		fprintf(stderr, "Error %d writing to channel \"%s\""
-			"\r\nvalue may not be supported.\r\n", v, what);
-		exit(0);
-	}
-}
-
-/* write attribute: long long int */
-static void wr_ch_lli(struct iio_channel *chn, const char* what, long long val)
-{
-	errchk(iio_channel_attr_write_longlong(chn, what, val), what);
-}
-
-/* write attribute: long long int */
-static long long rd_ch_lli(struct iio_channel *chn, const char* what)
-{
-	long long val;
-
-	errchk(iio_channel_attr_read_longlong(chn, what, &val), what);
-	printf("\t %s: %lld\r\n", what, val);
-	return val;
-}
-
-#if 0
-/* write attribute: string */
-static void wr_ch_str(struct iio_channel *chn, const char* what, const char* str)
-{
-	errchk(iio_channel_attr_write(chn, what, str), what);
-}
-#endif
-
-/* helper function generating channel names */
-static char *get_chn_name(const char* type, int id, char modify)
-{
-	if ('\0' == modify)
-		snprintf(tmpstr, sizeof(tmpstr), "%s%d", type, id);
-	else
-		snprintf(tmpstr, sizeof(tmpstr), "%s%d_%c", type, id, modify);
-	return tmpstr;
-}
-
-/* helper function to check return value of attr_write function */
-/* int chn, const char* type_string, const char* what, type_key value */
-#define IIO_ATTR(A, C, T, W, V) \
-do {\
-	int ret;\
-	ret = iio_channel_attr_##A_##T(C, W, V);\
-	if (ret < 0) {\
-		fprintf(stderr, "Error %d "#A" to channel \"%s\"\r\n", W);\
-		abort();\
-	}\
-} while (0);
-#endif
 
 /* finds datalink IIO devices */
 static struct iio_device *get_dlk_dev(struct iio_context *ctx, enum iopath p, int ig)
@@ -271,223 +195,186 @@ static struct iio_device *get_dlk_dev(struct iio_context *ctx, enum iopath p, in
 		sscanf(tmpstr, "%s-n%d", devname_dlk, ig+1);
 		dev = iio_context_find_device(ctx, tmpstr);
 	}
-	ASSERT((NULL != dev) && "the specified iio device not found");
+	ASSERT((NULL != dev) && "No iio-device found");
 	return dev;
 }
 
 /* finds datalink IIO channels */
-static struct iio_channel *get_dlk_chn_ss(struct iio_device *dev, enum iopath p, int ic, char modify)
+static struct iio_channel *get_dlk_chn_ss(struct iio_device *dev, enum iopath p, int ip, char modify)
 {
 	struct iio_channel *chn;
+
+	if (g_m_verbo > 3) printf("'DLK-%s' Acquiring channel-%s-%d ... ", dev->name, str_path[p], ip);
 #if 0
-	*chn = iio_device_find_channel(dev, get_chn_name("voltage", ic, modify), p == TX);
+	*chn = iio_device_find_channel(dev, GET_CHN_NAME("voltage", ip, modify), p == TX);
 	if (!*chn)
-		*chn = iio_device_find_channel(dev, get_chn_name("voltage", ic, modify), p == TX);
+		*chn = iio_device_find_channel(dev, GET_CHN_NAME("voltage", ip, modify), p == TX);
 #else
-	if (g_m_verbo > 0)
-		printf("* Acquiring dlk ss channel %s%d\r\n", p == TX ? "TX" : "RX", ic);
-	chn = iio_device_find_channel(dev, get_chn_name("voltage", ic, modify), p == TX);
+	chn = iio_device_find_channel(dev, GET_CHN_NAME("voltage", ip, modify), p == TX);
 #endif
-	ASSERT((NULL != chn) && "get_dlk_chn_ss: No channel found");
+	ASSERT((NULL != chn) && "No iio-channel found");
+	if (g_m_verbo > 3) printf("Succeed\r\n");
 	return chn;
 }
 
 /* JESD_RX(iio:device4) */
 	/* JESD_RX[0/1]_I(iio:device4/in_voltage[0/1]_i_xxx) */
 	/* JESD_RX[0/1]_Q(iio:device4/in_voltage[0/1]_q_xxx) */
-int init_iio_rxpath(int ig, size_t smp_nb)
+int init_dlk_rxpath(int ig, size_t smp_nb)
 {
-	if (g_m_verbo > 0)
-		printf("RX(g%d): Acquiring L3RX-JESD device\r\n", ig);
-	rxdev[ig] = iio_context_find_device(ctx, str_devname[L3RX]);
-	ASSERT((NULL != rxdev[ig]) && "No rxdev found");
-	iio_device_reg_write(rxdev[ig], 0x80000088, 0x6);// Clear all status bits
+	int ip;
+	
+	if (g_m_verbo > 2) printf("'DLK%d' Acquiring iio_rxdev ... ", ig);
+	iio_rxdev[ig] = get_dlk_dev(ctx, RX, ig);
+	ASSERT((NULL != iio_rxdev[ig]) && "No iio_rxdev found");
+	if (g_m_verbo > 2) printf("Succeed\r\n");
 
-	for (ic=0; ic<DEV_CHN_NB; ic++) {
-		if (g_chn_msk & (1 << ic)) {
-            if (g_m_verbo > 0)
-                printf("RX(g%dc%d): Initializing channels of L3RX-JESD device\r\n", ig, ic);
-			iio_rxchi[ig*DEV_CHN_NB+ic] = get_dlk_chn_ss(rxdev[ig], L3RX, ic, 'i');
-			ASSERT(ret && "No rxdev_p0i found");
-			iio_rxchq[ig*DEV_CHN_NB+ic] = get_dlk_chn_ss(rxdev[ig], L3RX, ic, 'q');
-			ASSERT(ret && "No rxdev_p0q found");
-			iio_channel_enable(iio_rxchi[ig*DEV_CHN_NB + ic]);
-			iio_channel_enable(iio_rxchq[ig*DEV_CHN_NB + ic]);
+	// Clear all DMA status bits
+	iio_device_reg_write(iio_rxdev[ig], 0x80000088, 0x6);
+
+	for (ip = 0; ip < DEV_PORT_NB; ip++) {
+		if (g_prt_msk & (1 << ip)) {
+			if (0 == g_dst_way) {
+				if (g_m_verbo > 2) printf("'DLK%d' Create rxfiles for RX-port%d ... ", ig, ip);
+				char str_rxfile[16];
+				sscanf(str_rxfile, "rxsmp%d", ip);
+				g_wfd[ig*DEV_PORT_NB + ip] = fopen(str_rxfile, "wb");
+				ASSERT(g_wfd[ig*DEV_PORT_NB+ip] && "fopen g_wfd failed");
+				if (g_m_verbo > 2) printf("Succeed\r\n");
+			}
+
+			if (g_m_verbo > 2) printf("'DLK%d' Enable i/q channels of RX-port%d ... ", ig, ip);
+			iiopr_chni[ig*DEV_PORT_NB+ip] = get_dlk_chn_ss(iio_rxdev[ig], RX, ip, 'i');
+			ASSERT(iiopr_chni[ig*DEV_PORT_NB+ip] && "No rxdev_p0i found");
+			iiopr_chnq[ig*DEV_PORT_NB+ip] = get_dlk_chn_ss(iio_rxdev[ig], RX, ip, 'q');
+			ASSERT(iiopr_chnq[ig*DEV_PORT_NB+ip] && "No rxdev_p0q found");
+			iio_channel_enable(iiopr_chni[ig*DEV_PORT_NB + ip]);
+			iio_channel_enable(iiopr_chnq[ig*DEV_PORT_NB + ip]);
+			if (g_m_verbo > 2) printf("Succeed\r\n");
 		}
 	}
 
-    if (g_m_verbo > 0)
-    	printf("RX(g%d): Creating non-cyclic buffers with %u samples\r\n", ig, smp_nb);
-	iio_txbuf[ig] = iio_device_create_buffer(rxdev[ig], smp_nb, false);
-	if (NULL == iio_txbuf[ig]) {
-		perror("RX: Creating buffers failed");
-		return -1;
-	}
-	ASSERT(4*DEV_CHN_NB == iio_device_get_sample_size(rxdev[ig]));
+    if (g_m_verbo > 2) printf("'DLK%d' Creating iio_rxbuf with %u samples ... ", ig, smp_nb);
+	iio_rxbuf[ig] = iio_device_create_buffer(iio_rxdev[ig], smp_nb, false);
+	ASSERT((NULL != iio_rxbuf[ig]) && "Create iio_rxbuf failed");
+	if (g_m_verbo > 2) printf("Succeed\r\n");
 
+	ASSERT(4*DEV_PORT_NB <= iio_device_get_sample_size(iio_rxdev[ig]));
 	return 0;
 }
 
 /* JESD_TX(iio:device3)*/
 /* JESD_TX[0/1]_I(iio:device3/out_voltage[0/2]_xxx)*/
 /* JESD_TX[0/1]_Q(iio:device3/out_voltage[1/3]_xxx)*/
-int init_iio_txpath(int ig, size_t smp_nb)
+int init_dlk_txpath(int ig, size_t smp_nb)
 {
-	if (g_m_verbo > 0)
-		printf("TX(g%d): Acquiring TX-JESD device\r\n", ig);
-	txdev[ig] = iio_context_find_device(ctx, str_devname[TX]);
-	ASSERT((NULL != txdev[ig]) && "No txdev found");
-	//iio_device_reg_write(txdev[ig], 0x80000088, 0x6);// Clear all status bits
+	int ip;
 
-	for (ic=0; ic<DEV_CHN_NB; ic++) {
-		if (g_chn_msk & (1 << ic)) {
-            if (g_m_verbo > 0)
-                printf("TX(g%d): Initializing channels of TX-JESD port%d\r\n", ig, ic);
-			ret = get_dlk_chn_ss(ctx, TX, txdev[ig], 2*ic,   0, 
-				&iio_txchi[ig*DEV_CHN_NB+ic]);
-			ASSERT(ret && "No txdev_p0i found");
-			ret = get_dlk_chn_ss(ctx, TX, txdev[ig], 2*ic+1, 0, 
-				&iio_txchq[ig*DEV_CHN_NB+ic]);
-			ASSERT(ret && "No txdev_p0q found");
-			iio_channel_enable(iio_txchi[ig*DEV_CHN_NB+ic]);
-			iio_channel_enable(iio_txchq[ig*DEV_CHN_NB+ic]);
+	if (g_m_verbo > 2) printf("'DLK%d' Acquiring iio_txdev ... ", ig);
+	iio_txdev[ig] = get_dlk_dev(ctx, TX, ig);
+	ASSERT(iio_txdev[ig] && "No iio_txdev found");
+	if (g_m_verbo > 2) printf("Succeed\r\n");
+
+	// Clear all DMA status bits
+	iio_device_reg_write(iio_txdev[ig], 0x80000088, 0x6);
+
+	for (ip = 0; ip < DEV_PORT_NB; ip++) {
+		if (g_prt_msk & (1 << ip)) {
+			if (0 == g_src_way) {
+				if (g_m_verbo > 2) printf("'DLK%d' Create txfiles for RX-port%d ... ", ig, ip);
+				char str_txfile[16];
+				sscanf(str_txfile, "txsmp%d", ip);
+				g_rfd[ig*DEV_PORT_NB + ip] = fopen(str_txfile, "rb");
+				ASSERT(g_rfd[ig*DEV_PORT_NB+ip] && "fopen g_rfd failed");
+				if (g_m_verbo > 2) printf("Succeed\r\n");
+			}
+
+			if (g_m_verbo > 2) printf("'DLK%d' Enable i/q channels of TX-port%d ... ", ig, ip);
+			iiopt_chni[ig*DEV_PORT_NB+ip] = get_dlk_chn_ss(iio_txdev[ig], TX, 2*ip, 0);
+			ASSERT(iiopt_chni[ig*DEV_PORT_NB+ip] && "No txdev_p0i found");
+			iiopt_chnq[ig*DEV_PORT_NB+ip] = get_dlk_chn_ss(iio_txdev[ig], TX, 2*ip+1, 0);
+			ASSERT(iiopt_chnq[ig*DEV_PORT_NB+ip] && "No txdev_p0q found");
+			iio_channel_enable(iiopt_chni[ig*DEV_PORT_NB+ip]);
+			iio_channel_enable(iiopt_chnq[ig*DEV_PORT_NB+ip]);
+			if (g_m_verbo > 2) printf("Succeed\r\n");
 		}
 	}
-    if (g_m_verbo > 0)
-    	printf("TX(g%d): Creating non-cyclic buffers with %u samples\r\n",
-    	    ig, smp_nb);
-	iio_rxbuf[ig] = iio_device_create_buffer(txdev[ig], smp_nb, false);
-	if (NULL == iio_rxbuf[ig]) {
-		perror("TX: Create buffers failed");
-		return -1;
-	}
-	ASSERT(4*DEV_CHN_NB == iio_device_get_sample_size(txdev[ig]));
 
+    if (g_m_verbo > 2) printf("'DLK%d' Creating iio_txbuf with %u samples ... ", ig, smp_nb);
+	iio_txbuf[ig] = iio_device_create_buffer(iio_txdev[ig], smp_nb, false);
+	ASSERT((NULL != iio_txbuf[ig]) && "Create iio_txbuf failed");
+	if (g_m_verbo > 2) printf("Succeed\r\n");
+
+	ASSERT(4*DEV_PORT_NB <= iio_device_get_sample_size(iio_txdev[ig]));
 	return 0;
 }
 
-void rxbuf_dump(int ig)
+static void rxbuf_dump(int ig)
 {
 	void *p_end;
 	ptrdiff_t p_inc;
 	uint8_t *pbyte;
 	size_t i;
-	int ic;
-	uint16_t *p_d16;
-	struct iio_sample *psample;
-
-	p_inc = iio_buffer_step(iio_txbuf[ig]);
-	p_end = iio_buffer_end(iio_txbuf[ig]);
-	printf("<-- iio_rxbuf: step=%d, end=0x%08X", (int)p_inc, p_end);
-	for (ic=0; ic<DEV_CHN_NB; ic++) {
-		printf(" P%dI_start=0x%08X, P%dQ_start=0x%08X", 
-			ic, iio_buffer_first(iio_txbuf[ig], iio_rxchi[ig*DEV_CHN_NB+ic]),
-			ic, iio_buffer_first(iio_txbuf[ig], iio_rxchq[ig*DEV_CHN_NB+ic]));
-	}
-	printf("\r\n<-- iio_rxbuf: RAW:");
-	pbyte = iio_buffer_first(iio_txbuf[ig], iio_rxchi[ig*DEV_CHN_NB]);
-	for (i=0; (void *)pbyte < p_end; pbyte++, i++) {
-		if (0 == i % 16) printf("\r\n");
-		printf("%02x ", *pbyte);
-	}
-	fflush(stdout);
-
-	printf("\r\n<-- iio_rxbuf: Samples:");
-	for (ic=0; ic<DEV_CHN_NB; ic++) printf(" P%dI, P%dQ", ic, ic);
-	printf("\t");
-	for (ic=0; ic<DEV_CHN_NB; ic++) printf(" P%dI, P%dQ", ic, ic);
-	//psample = (struct iio_sample *)(pbuf->buffer);
-	//iio_txbuf[ig]->data_length;
-	psample = iio_buffer_first(iio_txbuf[ig], iio_rxchi[ig*DEV_CHN_NB]);
-	for (i = 0; (void *)psample < p_end; i++) {
-		if (i & 1) printf("\t"); else printf("\r\n");
-		for (ic=0; ic<DEV_CHN_NB; ic++) {
-			printf("%04x %04x ", (uint16_t)psample->i16, (uint16_t)psample->q16);
-			psample++;
-		}
-	}
-#if 0
-	for (ic=0; ic<DEV_CHN_NB; ic++) {
-		printf("\r\n<-- iio_rxbuf: P%dI: ", ic);
-		p_d16 = iio_buffer_first(iio_txbuf[ig], iio_rxchi[ig*DEV_CHN_NB+ic]);
-		for (i = 0; (void *)p_d16 < p_end; p_d16 += p_inc/sizeof(*p_d16), i++) {
-			printf("%04x ", p_d16[0]);
-		}
-		printf("\r\n<-- iio_rxbuf: P%dQ: ", ic);
-		p_d16 = iio_buffer_first(iio_txbuf[ig], iio_rxchq[ig*DEV_CHN_NB+ic]);
-		for (i = 0; (void *)p_d16 < p_end; p_d16 += p_inc/sizeof(*p_d16), i++) {
-			printf("%04x ", p_d16[0]);
-		}
-	}
-#endif
-	printf("\r\n");
-	fflush(stdout);
-}
-
-void txbuf_dump(int ig)
-{
-	void *p_end;
-	ptrdiff_t p_inc;
-	uint8_t *pbyte;
-	size_t i;
-	int ic;
+	int ip;
 	uint16_t *p_d16;
 	struct iio_sample *psample;
 
 	p_inc = iio_buffer_step(iio_rxbuf[ig]);
 	p_end = iio_buffer_end(iio_rxbuf[ig]);
-	printf("--> iio_txbuf: step=%d, end=0x%08X", (int)p_inc, p_end);
-	for (ic=0; ic<DEV_CHN_NB; ic++) {
+	printf("<-- iio_rxbuf: step=%d, end=0x%08X", (int)p_inc, p_end);
+	for (ip = 0; ip < DEV_PORT_NB; ip++) {
 		printf(" P%dI_start=0x%08X, P%dQ_start=0x%08X", 
-			ic, iio_buffer_first(iio_rxbuf[ig], iio_txchi[ig*DEV_CHN_NB+ic]),
-			ic, iio_buffer_first(iio_rxbuf[ig], iio_txchq[ig*DEV_CHN_NB+ic]));
+			ip, iio_buffer_first(iio_rxbuf[ig], iiopr_chni[ig*DEV_PORT_NB+ip]),
+			ip, iio_buffer_first(iio_rxbuf[ig], iiopr_chnq[ig*DEV_PORT_NB+ip]));
 	}
+	printf("\r\n");	//fflush(stdout);
 
-	printf("\r\n--> iio_txbuf: RAW:");
-	pbyte = iio_buffer_first(iio_rxbuf[ig], iio_txchi[ig*DEV_CHN_NB]);
-	for (i = 0; (void *)pbyte < p_end; pbyte++, i++) {
+	printf"<-- iio_rxbuf: RAW:");
+	pbyte = iio_buffer_first(iio_rxbuf[ig], iiopr_chni[ig*DEV_PORT_NB]);
+	for (i=0; (void *)pbyte < p_end; pbyte++, i++) {
 		if (0 == i % 16) printf("\r\n");
 		printf("%02x ", *pbyte);
 	}
-	fflush(stdout);
+	printf("\r\n"); //fflush(stdout);
 
-	printf("\r\n--> iio_txbuf: Samples:");
-	for (ic=0; ic<DEV_CHN_NB; ic++) printf(" P%dI, P%dQ", ic, ic);
+	printf("<-- iio_rxbuf: Samples:");
+	for (ip = 0; ip < DEV_PORT_NB; ip++) printf(" P%dI, P%dQ", ip, ip);
 	printf("\t");
-	for (ic=0; ic<DEV_CHN_NB; ic++) printf(" P%dI, P%dQ", ic, ic);
+	for (ip = 0; ip < DEV_PORT_NB; ip++) printf(" P%dI, P%dQ", ip, ip);
 	//psample = (struct iio_sample *)(pbuf->buffer);
 	//iio_rxbuf[ig]->data_length;
-	psample = iio_buffer_first(iio_rxbuf[ig], iio_txchi[ig*DEV_CHN_NB]);
-	for (i = 0;	(void *)psample < p_end; i++) {
+	psample = iio_buffer_first(iio_rxbuf[ig], iiopr_chni[ig*DEV_PORT_NB]);
+	for (i = 0; (void *)psample < p_end; i++) {
 		if (i & 1) printf("\t"); else printf("\r\n");
-		for (ic=0; ic<DEV_CHN_NB; ic++) {
+		for (ip = 0; ip < DEV_PORT_NB; ip++) {
 			printf("%04x %04x ", (uint16_t)psample->i16, (uint16_t)psample->q16);
 			psample++;
 		}
 	}
+	printf("\r\n"); //fflush(stdout);
 #if 0
-	for (ic=0; ic<DEV_CHN_NB; ic++) {	
-		printf("\r\n--> iio_txbuf: P%dI: ", ic);
-		p_d16 = iio_buffer_first(iio_rxbuf[ig], iio_txchi[ig*DEV_CHN_NB+ic]);
+	for (ip = 0; ip < DEV_PORT_NB; ip++) {
+		printf("<-- iio_rxbuf: P%dI: ", ip);
+		p_d16 = iio_buffer_first(iio_rxbuf[ig], iiopr_chni[ig*DEV_PORT_NB+ip]);
 		for (i = 0; (void *)p_d16 < p_end; p_d16 += p_inc/sizeof(*p_d16), i++) {
 			printf("%04x ", p_d16[0]);
 		}
-		printf("\r\n--> iio_txbuf: P%dQ: ", ic);
-		p_d16 = iio_buffer_first(iio_rxbuf[ig], iio_txchq[ig*DEV_CHN_NB+ic]);
+		printf("\r\n"); //fflush(stdout);
+		printf("<-- iio_rxbuf: P%dQ: ", ip);
+		p_d16 = iio_buffer_first(iio_rxbuf[ig], iiopr_chnq[ig*DEV_PORT_NB+ip]);
 		for (i = 0; (void *)p_d16 < p_end; p_d16 += p_inc/sizeof(*p_d16), i++) {
 			printf("%04x ", p_d16[0]);
 		}
 	}
+	printf("\r\n"); //fflush(stdout);
 #endif
-	printf("\r\n");
-	fflush(stdout);
 }
 
 /* Method0: */
 static void rxbuf_filew(int ig, ssize_t nbytes_from_k)
 {
-	fwrite(iio_txbuf[ig], 1, nbytes_from_k, wfd);
-	fflush(wfd);
+	fwrite(iio_rxbuf[ig], 1, nbytes_from_k, g_wfd);
+	fflush(g_wfd);
 }
 
 // Method1: sample by sample
@@ -501,9 +388,9 @@ static void rxbuf_memcopy(int ig, ssize_t nbytes_from_k)
 	ptrdiff_t p_inc;
 	size_t nb;
 
-	ASSERT(1 == DEV_CHN_NB); /* samples of P0 and P1 are interleaved */
+	ASSERT(1 == DEV_PORT_NB); /* samples of P0 and P1 are interleaved */
 
-	p_d16 = iio_buffer_first(iio_txbuf[ig], iio_rxchi[ig*DEV_CHN_NB]);
+	p_d16 = iio_buffer_first(iio_rxbuf[ig], iiopr_chni[ig*DEV_PORT_NB]);
 	do {
 		nb = min(nbytes_from_k, RADIO_SYM2SMP*4);
 		memcpy((void *)rawst_cbuf[rawst_iw] + PUSCH_PLDOF, p_d16, nb/2);
@@ -516,30 +403,29 @@ static void rxbuf_memcopy(int ig, ssize_t nbytes_from_k)
 
 // Method2: iio_channel_read_raw()
 // Method3: iio_channel_read()
-// TODO: get known
-static void rxbuf_apiread(int ig, ssize_t nbytes_from_k)
+static void rxbuf_apir(int ig, ssize_t nbytes_from_k)
 {
-	int ic, iblk;
+	int ip, iblk;
 	uint8_t *testbuf;
 
 	/* p0i0, p0i1, ...	p0q0, p0q1, ... */
 	testbuf = malloc(nbytes_from_k);
-	for (ic=0; ic<DEV_CHN_NB; ic++) {
+	for (ip = 0; ip < DEV_PORT_NB; ip++) {
 		if (3 == g_dst_way) {
-			iio_channel_read_raw(iio_rxchi[ic], iio_txbuf[0], testbuf, RADIO_SYM2SMP*2);
+			iio_channel_read_raw(iiopr_chni[ip], iio_rxbuf[0], testbuf, RADIO_SYM2SMP*2);
 			testbuf += RADIO_SYM2SMP*2;
-			iio_channel_read_raw(iio_rxchq[ic], iio_txbuf[0], testbuf, RADIO_SYM2SMP*2);
+			iio_channel_read_raw(iiopr_chnq[ip], iio_rxbuf[0], testbuf, RADIO_SYM2SMP*2);
 		} else {
-			iio_channel_read(iio_rxchi[ic], iio_txbuf[0], testbuf, RADIO_SYM2SMP*2);
+			iio_channel_read(iiopr_chni[ip], iio_rxbuf[0], testbuf, RADIO_SYM2SMP*2);
 			testbuf += RADIO_SYM2SMP*2;
-			iio_channel_read(iio_rxchq[ic], iio_txbuf[0], testbuf, RADIO_SYM2SMP*2);
+			iio_channel_read(iiopr_chnq[ip], iio_rxbuf[0], testbuf, RADIO_SYM2SMP*2);
 		}
 	}
 	free(testbuf);
 }
 
 /* Method4: sample by sample, Example: swap Real(I) and Imag(Q)
-	p_inc == iio_device_get_sample_size(rxdev[ig]) == DEV_CHN_NB*4
+	p_inc == iio_device_get_sample_size(iio_rxdev[ig]) == DEV_PORT_NB*4
 	ismp == (p_end-p_d16)/p_inc == nbytes_from_k/(PORTS*4) <= IIO_SMP_MAX
 */
 static void rxbuf_foreach(int ig, ssize_t nbytes_from_k)
@@ -547,16 +433,16 @@ static void rxbuf_foreach(int ig, ssize_t nbytes_from_k)
 	ptrdiff_t p_inc;
 	void *p_end;
 	int16_t *p_d16;
-	int ic, ismp;
+	int ip, ismp;
 	int16_t i16, q16;
 
-	p_inc = iio_buffer_step(iio_txbuf[ig]);
-	p_end = iio_buffer_end(iio_txbuf[ig]);
-	p_d16 = (int16_t *)iio_buffer_first(iio_txbuf[ig], iio_rxchi[ig*DEV_CHN_NB]);
+	p_inc = iio_buffer_step(iio_rxbuf[ig]);
+	p_end = iio_buffer_end(iio_rxbuf[ig]);
+	p_d16 = (int16_t *)iio_buffer_first(iio_rxbuf[ig], iiopr_chni[ig*DEV_PORT_NB]);
 #if 1
 	do {
-		for (ic=0; ic<DEV_CHN_NB; ic++) {
-			if (g_chn_msk & (1 << ic)) {
+		for (ip = 0; ip < DEV_PORT_NB; ip++) {
+			if (g_prt_msk & (1 << ip)) {
 				i16 = *(p_d16 + 0);
 				q16 = *(p_d16 + 1);
 				*p_d16++ = q16;
@@ -568,12 +454,12 @@ static void rxbuf_foreach(int ig, ssize_t nbytes_from_k)
 	struct bbu_payload *pl;
 	do {
 		pl = (struct bbu_payload *)txring_pusch_offset(rawst_iw);
-		for (ismp=0; ismp<min(nbytes_from_k/DEV_CHN_NB*4, RADIO_SYM2SMP); ismp++) {
-			for (ic=0; ic<DEV_CHN_NB; ic++) {
-				pl->iqs[ic][ismp].i8 = *p_d16++;	// LSB of I[ismp][ic]
-				p_d16++;							// MSB of I[ismp][ic]
-				pl->iqs[ic][ismp].q8 = *p_d16++;	// LSB of Q[ismp][ic]
-				p_d16++;							// MSB of Q[ismp][ic]
+		for (ismp=0; ismp<min(nbytes_from_k/DEV_PORT_NB*4, RADIO_SYM2SMP); ismp++) {
+			for (ip = 0; ip < DEV_PORT_NB; ip++) {
+				pl->iqs[ip][ismp].i8 = *p_d16++;	// LSB of I[ismp][ip]
+				p_d16++;							// MSB of I[ismp][ip]
+				pl->iqs[ip][ismp].q8 = *p_d16++;	// LSB of Q[ismp][ip]
+				p_d16++;							// MSB of Q[ismp][ip]
 			}
 		}
 		nbytes_from_k -= ismp*p_inc;
@@ -582,10 +468,8 @@ static void rxbuf_foreach(int ig, ssize_t nbytes_from_k)
 #endif
 }
 
-// Method5: iio_buffer_foreach_sample() with callback()
-// TODO: get known
-static ssize_t rxbuf_callback(const struct iio_channel *chn,
-			void *p_smp, size_t smp_n, void *opt)
+// Method5: iio_buffer_foreach_sample() with callback() : TODO
+static ssize_t rxbuf_callback(struct iio_channel *chn, void *p_smp, size_t smp_n, void *opt)
 {
 	if (!iio_channel_is_enabled(chn))
 		return 0;
@@ -612,7 +496,7 @@ static ssize_t rxbuf_callback(const struct iio_channel *chn,
 
 	*p_dst = *p_smp & 0xff; /* for example, only LSB */
 	p_dst += 2;	/* p0i0, p0q0, p0i1, p0q1, ... */
-	//p_smp += iio_buffer_step(iio_txbuf[0]);
+	//p_smp += iio_buffer_step(iio_rxbuf[0]);
 	//smp_n--;
 
 #endif
@@ -624,9 +508,9 @@ int handle_iio_rxpath(int ig)
 	ssize_t nbytes_from_k;
 	uint32_t val;
 
-	nbytes_from_k = iio_buffer_refill(iio_txbuf[ig]);
+	nbytes_from_k = iio_buffer_refill(iio_rxbuf[ig]);
 	if (g_m_verbo > 1) {
-		iio_device_reg_read(rxdev[ig], 0x80000088, &val);
+		iio_device_reg_read(iio_rxdev[ig], 0x80000088, &val);
 		printf("\r\n<-- read rxdma[%d] status=0x%08x\r\n", val);
 	}
 	if (nbytes_from_k < 0) {
@@ -636,7 +520,7 @@ int handle_iio_rxpath(int ig)
 	}
 
 	if (g_m_verbo > 0) {
-		ASSERT(nbytes_from_k <= IIO_SMP_MAX*4*DEV_CHN_NB);
+		ASSERT(nbytes_from_k <= IIO_SMP_MAX*4*DEV_PORT_NB);
 		printf("<-- iio_buffer_refill(): k_iio => u_libiio %u Bytes\r\n",
 			(size_t)nbytes_from_k);
 	}
@@ -645,122 +529,121 @@ int handle_iio_rxpath(int ig)
 	}
 
 	switch (g_dst_way) {
-	case 5:
-		iio_buffer_foreach_sample(iio_txbuf[ig], rxbuf_callback, NULL);
-		break;
-	case 4:
-		rxbuf_foreach(ig, nbytes_from_k);
-		break;
-	case 3:
-	case 2:
-		rxbuf_apiread(ig, nbytes_from_k);
+	case 0:
+		rxbuf_filew(ig, nbytes_from_k);
 		break;
 	case 1:
 		rxbuf_memcopy(ig, nbytes_from_k);
 		break;
-	case 0:
+	case 2:
+	case 3:
+		rxbuf_apir(ig, nbytes_from_k);
+		break;
 	default:
-		rxbuf_filew(ig, nbytes_from_k);
+	case 4:
+		rxbuf_foreach(ig, nbytes_from_k);
+		break;
+	case 5:
+		iio_buffer_foreach_sample(iio_rxbuf[ig], rxbuf_callback, NULL);
 		break;
 	}
 
 #if defined(FPGA_COMPRESS_SAMPLES)
-	rxsnb[ig] += nbytes_from_k/iio_buffer_step(iio_txbuf[ig])*2;
+	rxsnb[ig] += nbytes_from_k/iio_buffer_step(iio_rxbuf[ig])*2;
 #else
-    rxsnb[ig] += nbytes_from_k/iio_buffer_step(iio_txbuf[ig]);
+    rxsnb[ig] += nbytes_from_k/iio_buffer_step(iio_rxbuf[ig]);
 #endif
 	return 0;
 }
 
-/* Method0: */
-static void txbuf_filer(int ig, ssize_t nbytes_to_k)
+static void txbuf_dump(int ig)
 {
-	fread(iio_rxbuf[ig], 1, nbytes_to_k, rfd);
-	fflush(rfd);
-}
-
-/* Example: fill with 0xff
-  iio_buffer_foreach_sample();
-  p_inc == iio_device_get_sample_size(txdev[ig]) == DEV_CHN_NB*4
-  ismp == nbytes_to_k/p_inc == nbytes_to_k/(DEV_CHN_NB*4) <= IIO_SMP_MAX
-AD9361:
-  14-bit sample needs to be MSB alligned so shift by 2
-  https://wiki.analog.com/resources/eval/user-guides/ad-fmcomms2-ebz/software/basic_iq_datafiles#binary_format
-AD9371:
-  a10ad9371> cat iio:device4/scan_elements/in_voltage0_i_type
-  le:S16/16>>0
-  a10ad9371> cat iio:device3/scan_elements/out_voltage0_type
-  le:S16/16>>0
-*/
-static void txbuf_foreach(int ig, ssize_t nbytes_to_k)
-{
+	void *p_end;
 	ptrdiff_t p_inc;
-	void *p_end, *p_stt;
-	int16_t *p_d16;
-	int ic, ismp;
+	uint8_t *pbyte;
+	size_t i;
+	int ip;
+	uint16_t *p_d16;
+	struct iio_sample *psample;
 
-	p_inc = iio_buffer_step(iio_rxbuf[ig]);
-	p_end = iio_buffer_end(iio_rxbuf[ig]);
-	p_d16 = (int16_t *)iio_buffer_first(iio_rxbuf[ig], iio_txchi[ig*DEV_CHN_NB]);
-	nbytes_to_k = p_end - (void *)p_d16;
-#if 1
-	do {
-		for (ic=0; ic<DEV_CHN_NB; ic++) {
-			if (g_chn_msk & (1 << ic)) {
-				*p_d16++ = g_pattern;
-				*p_d16++ = g_pattern;
-			}
+	p_inc = iio_buffer_step(iio_txbuf[ig]);
+	p_end = iio_buffer_end(iio_txbuf[ig]);
+	printf("--> iio_txbuf: step=%d, end=0x%08X", (int)p_inc, p_end);
+	for (ip = 0; ip < DEV_PORT_NB; ip++) {
+		printf(" P%dI_start=0x%08X, P%dQ_start=0x%08X", 
+			ip, iio_buffer_first(iio_txbuf[ig], iiopt_chni[ig*DEV_PORT_NB+ip]),
+			ip, iio_buffer_first(iio_txbuf[ig], iiopt_chnq[ig*DEV_PORT_NB+ip]));
+	}
+	printf("\r\n"); //fflush(stdout);
+
+	printf("--> iio_txbuf: RAW:");
+	pbyte = iio_buffer_first(iio_txbuf[ig], iiopt_chni[ig*DEV_PORT_NB]);
+	for (i = 0; (void *)pbyte < p_end; pbyte++, i++) {
+		if (0 == i % 16) printf("\r\n");
+		printf("%02x ", *pbyte);
+	}
+	printf("\r\n"); //fflush(stdout);
+
+	printf("--> iio_txbuf: Samples:");
+	for (ip = 0; ip < DEV_PORT_NB; ip++) printf(" P%dI, P%dQ", ip, ip);
+	printf("\t");
+	for (ip = 0; ip < DEV_PORT_NB; ip++) printf(" P%dI, P%dQ", ip, ip);
+	//psample = (struct iio_sample *)(pbuf->buffer);
+	//iio_txbuf[ig]->data_length;
+	psample = iio_buffer_first(iio_txbuf[ig], iiopt_chni[ig*DEV_PORT_NB]);
+	for (i = 0;	(void *)psample < p_end; i++) {
+		if (i & 1) printf("\t"); else printf("\r\n");
+		for (ip = 0; ip < DEV_PORT_NB; ip++) {
+			printf("%04x %04x ", (uint16_t)psample->i16, (uint16_t)psample->q16);
+			psample++;
 		}
-	} while ((void *)p_d16 < p_end);
-#else //defined(BUILDING_RRU_DL)
-	struct bbu_payload *pl;
-	int nb, tmp;
-	do {
-		if (rawsr_iw < rawsr_ir + RAWSR_BUF_NB_NOW/2) {
-			sleep(0);
-			continue;
+	}
+	printf("\r\n"); //fflush(stdout);
+#if 0
+	for (ip = 0; ip < DEV_PORT_NB; ip++) {	
+		printf("--> iio_txbuf: P%dI: ", ip);
+		p_d16 = iio_buffer_first(iio_txbuf[ig], iiopt_chni[ig*DEV_PORT_NB+ip]);
+		for (i = 0; (void *)p_d16 < p_end; p_d16 += p_inc/sizeof(*p_d16), i++) {
+			printf("%04x ", p_d16[0]);
 		}
-		tmp = rawsr_ir + RAWSR_BUF_NB_NOW/2;
-		nb = RADIO_SYM2SMP*DEV_CHN_NB*4;
-		do {
-#if defined(BUILDING_RRU_PUSCH_B2B)// board circle-pusch for testing
-			pl = (struct bbu_payload *)(&rawsr_cbuf[rawsr_ir][0] + PUSCH_PLDOF);
-#else
-			pl = (struct bbu_payload *)(&rawsr_cbuf[rawsr_ir][0] + PDSCH_PLDOF);
-#endif
-			for (ismp=0; ismp<RADIO_SYM2SMP; ismp++) {
-				for (ic=0; ic<DEV_CHN_NB; ic++) {
-					*p_d16++ = pl->iqs[ic][ismp].i8;	// LSB of I[ismp][ic]
-					p_d16++;							// MSB of I[ismp][ic]
-					*p_d16++ = pl->iqs[ic][ismp].q8;	// LSB of I[ismp][ic]
-					p_d16++;							// MSB of I[ismp][ic]
-				}
-			}
-			rawsr_ir++;
-		} while (rawsr_ir == tmp)
-	} while (rawsr_iw > rawsr_ir + RAWSR_BUF_NB_NOW/2);
+		printf("\r\n"); //fflush(stdout);
+		printf("--> iio_txbuf: P%dQ: ", ip);
+		p_d16 = iio_buffer_first(iio_txbuf[ig], iiopt_chnq[ig*DEV_PORT_NB+ip]);
+		for (i = 0; (void *)p_d16 < p_end; p_d16 += p_inc/sizeof(*p_d16), i++) {
+			printf("%04x ", p_d16[0]);
+		}
+	}
+	printf("\r\n"); //fflush(stdout);
 #endif
 }
 
-static void txbuf_memcopy(int ig, ssize_t nbytes_to_k)
+/* Method0: */
+static void txbuf_filer(int ig, ssize_t nb2k)
+{
+	fread(iio_txbuf[ig], 1, nb2k, g_rfd);
+	fflush(g_rfd);
+}
+
+/* Method1: */
+static void txbuf_memcopy(int ig, ssize_t nb2k)
 {
 	ptrdiff_t p_inc;
 	void *p_end, *p_d16;
-	int ic, ismp, nb, tmp;
+	int ip, ismp, nb, tmp;
 
-	p_inc = iio_buffer_step(iio_rxbuf[ig]);
-	p_end = iio_buffer_end(iio_rxbuf[ig]);
-	p_d16 = iio_buffer_first(iio_rxbuf[ig], iio_txchi[ig*DEV_CHN_NB]);
-	nbytes_to_k = p_end - p_d16;
+	p_inc = iio_buffer_step(iio_txbuf[ig]);
+	p_end = iio_buffer_end(iio_txbuf[ig]);
+	p_d16 = iio_buffer_first(iio_txbuf[ig], iiopt_chni[ig*DEV_PORT_NB]);
+	nb2k = p_end - p_d16;
 #if 0
-	ASSERT(1 == DEV_CHN_NB);
+	ASSERT(1 == DEV_PORT_NB);
 	do {
 		if (rawsr_iw < rawsr_ir + RAWSR_BUF_NB_NOW/2) {
 			sleep(0);
 			continue;
 		}
 		tmp = rawsr_ir + RAWSR_BUF_NB_NOW/2;
-		nb = RADIO_SYM2SMP*DEV_CHN_NB*4;
+		nb = RADIO_SYM2SMP*DEV_PORT_NB*4;
 		do {
 			memcpy(p_d16, rawsr_cbuf[rawsr_ir] + PDSCH_PLDOF, nb/2);
 			p_d16 += nb/2;
@@ -774,55 +657,153 @@ static void txbuf_memcopy(int ig, ssize_t nbytes_to_k)
 #endif
 }
 
+// Method2: iio_channel_write_raw()
+// Method3: iio_channel_write()
+#if 0
+static void rxbuf_apiw(int ig, ssize_t nb2k)
+{
+	int ip, iblk;
+	uint8_t *testbuf;
+
+	/* p0i0, p0i1, ...	p0q0, p0q1, ... */
+	testbuf = malloc(nbytes_from_k);
+	/*for (ip = 0; ip < DEV_PORT_NB; ip++) {
+		if (3 == g_dst_way) {
+			iio_channel_read_raw(iiopr_chni[ip], iio_rxbuf[0], testbuf, RADIO_SYM2SMP*2);
+			testbuf += RADIO_SYM2SMP*2;
+			iio_channel_read_raw(iiopr_chnq[ip], iio_rxbuf[0], testbuf, RADIO_SYM2SMP*2);
+		} else {
+			iio_channel_read(iiopr_chni[ip], iio_rxbuf[0], testbuf, RADIO_SYM2SMP*2);
+			testbuf += RADIO_SYM2SMP*2;
+			iio_channel_read(iiopr_chnq[ip], iio_rxbuf[0], testbuf, RADIO_SYM2SMP*2);
+		}
+	}*/
+	free(testbuf);
+}
+#endif
+
+/* Example: fill with 0xff
+  p_inc == iio_device_get_sample_size(iio_txdev[ig]) == DEV_PORT_NB*4
+   ismp == nb2k/p_inc == nb2k/(DEV_PORT_NB*4) <= IIO_SMP_MAX
+AD9361:
+  14-bit sample needs to be MSB alligned so shift by 2
+  https://wiki.analog.com/resources/eval/user-guides/ad-fmcomms2-ebz/software/basic_iq_datafiles#binary_format
+AD9371:
+  a10ad9371> cat iio:device4/scan_elements/in_voltage0_i_type
+  le:S16/16>>0
+  a10ad9371> cat iio:device3/scan_elements/out_voltage0_type
+  le:S16/16>>0
+*/
+static void txbuf_foreach(int ig, ssize_t nb2k)
+{
+	ptrdiff_t p_inc;
+	void *p_end, *p_stt;
+	int16_t *p_d16;
+	int ip, ismp;
+
+	p_inc = iio_buffer_step(iio_txbuf[ig]);
+	p_end = iio_buffer_end(iio_txbuf[ig]);
+	p_d16 = (int16_t *)iio_buffer_first(iio_txbuf[ig], iiopt_chni[ig*DEV_PORT_NB]);
+	nb2k = p_end - (void *)p_d16;
+#if 1
+	do {
+		for (ip = 0; ip < DEV_PORT_NB; ip++) {
+			if (g_prt_msk & (1 << ip)) {
+				*p_d16++ = g_word_pn;
+				*p_d16++ = g_word_pn;
+			}
+		}
+	} while ((void *)p_d16 < p_end);
+#else //defined(BUILDING_RRU_DL)
+	struct bbu_payload *pl;
+	int nb, tmp;
+	do {
+		if (rawsr_iw < rawsr_ir + RAWSR_BUF_NB_NOW/2) {
+			sleep(0);
+			continue;
+		}
+		tmp = rawsr_ir + RAWSR_BUF_NB_NOW/2;
+		nb = RADIO_SYM2SMP*DEV_PORT_NB*4;
+		do {
+#if defined(BUILDING_RRU_PUSCH_B2B)// board circle-pusch for testing
+			pl = (struct bbu_payload *)(&rawsr_cbuf[rawsr_ir][0] + PUSCH_PLDOF);
+#else
+			pl = (struct bbu_payload *)(&rawsr_cbuf[rawsr_ir][0] + PDSCH_PLDOF);
+#endif
+			for (ismp=0; ismp<RADIO_SYM2SMP; ismp++) {
+				for (ip = 0; ip < DEV_PORT_NB; ip++) {
+					*p_d16++ = pl->iqs[ip][ismp].i8;	// LSB of I[ismp][ip]
+					p_d16++;							// MSB of I[ismp][ip]
+					*p_d16++ = pl->iqs[ip][ismp].q8;	// LSB of I[ismp][ip]
+					p_d16++;							// MSB of I[ismp][ip]
+				}
+			}
+			rawsr_ir++;
+		} while (rawsr_ir == tmp)
+	} while (rawsr_iw > rawsr_ir + RAWSR_BUF_NB_NOW/2);
+#endif
+}
+
+// Method5: iio_buffer_foreach_sample() with callback() : TODO
+#if 0
+static ssize_t txbuf_callback(struct iio_channel *chn, void *p_smp, size_t smp_n, void *opt)
+{
+	if (!iio_channel_is_enabled(chn))
+		return 0;
+	printf("TODO");
+}
+#endif
+
 int handle_iio_txpath(int ig)
 {
-	ssize_t nbytes_to_k;
-	int ic;
+	ssize_t nb2k;
+	int ip;
 	uint32_t val;
 
-	nbytes_to_k = iio_buffer_push(iio_rxbuf[ig]);
+	nb2k = iio_buffer_push(iio_txbuf[ig]);
 	if (g_m_verbo > 1) {
-		iio_device_reg_read(txdev[ig], 0x80000088, &val);
+		iio_device_reg_read(iio_txdev[ig], 0x80000088, &val);
 		printf("\r\n--> read txdma[%d] status=0x%08x\r\n",
 			ig, val);
 	}
-	if (nbytes_to_k < 0) {
+	if (nb2k < 0) {
 		fprintf(stderr, "--> iio_buffer_push(): error %s\r\n",
-			strerror(-(int)nbytes_to_k));
+			strerror(-(int)nb2k));
 		return -1;
 	}
 	if (g_m_verbo > 0) {
-		ASSERT(nbytes_to_k <= IIO_SMP_MAX*4*DEV_CHN_NB);
+		ASSERT(nb2k <= IIO_SMP_MAX*4*DEV_PORT_NB);
 		printf("--> iio_buffer_push(): u_libiio => k_iio %u Bytes\r\n",
-			(size_t)nbytes_to_k);
+			(size_t)nb2k);
 	}
 
 	switch (g_src_way) {
-	case 4:
-	case 3:
-		printf("\r\ncase3/4 TODO\r\n");
-		break;
-	case 2:
-		printf("\r\ncase2 TODO\r\n");
+	case 0:
+		txbuf_foreach(ig, nb2k);
 		break;
 	case 1:
-		txbuf_memcopy(ig, nbytes_to_k);
+		txbuf_memcopy(ig, nb2k);
+		break;
+	case 2:
+	case 3:
+		printf("TODO: txbuf_apiw \r\n");
+		break;
+	case 3:
+		txbuf_foreach(ig, nb2k);
+		break;
+	case 4:
+		printf("TODO: txbuf_foreach\r\n");
 		break;
 	default:
-	case 0:
-		txbuf_foreach(ig, nbytes_to_k);
-		break;
 	}
 
 #if defined(FPGA_COMPRESS_SAMPLES)
-	txsnb[ig] += nbytes_to_k/iio_buffer_step(iio_rxbuf[ig])*2;
+	txsnb[ig] += nb2k/iio_buffer_step(iio_txbuf[ig])*2;
 #else
-	txsnb[ig] += nbytes_to_k/iio_buffer_step(iio_rxbuf[ig]);
+	txsnb[ig] += nb2k/iio_buffer_step(iio_txbuf[ig]);
 #endif
 
-	if (g_m_verbo > 2) {
-		txbuf_dump(ig);
-	}
+	if (g_m_verbo > 2) txbuf_dump(ig);
 
 	return 0;
 }
@@ -833,20 +814,17 @@ int is_iiorxdma_overflow(int ig)
 	int ret;
 	uint32_t val;
 
-	ret = iio_device_reg_read(rxdev[ig], 0x80000088, &val);
+	ret = iio_device_reg_read(iio_rxdev[ig], 0x80000088, &val);
 	if (0 != ret) {
-		fprintf(stderr, "<-- read rxdma[%d] status failed %s\r\n",
-			ig, strerror(-ret));
+		fprintf(stderr, "rxdma[%d] read-status failed %s\r\n", ig, strerror(-ret));
 		return -1;
 	}
-	if (g_m_verbo > 1)
-		printf("<-- rxdma[%d] status=0x%08x\r\n", ig, val);
+	if (g_m_verbo > 1) printf("rxdma[%d] status=0x%08x\r\n", ig, val);
 
 	// Clear status bits by writting value back
-	if (0 != val) iio_device_reg_write(rxdev[ig], 0x80000088, val);
+	if (0 != val) iio_device_reg_write(iio_rxdev[ig], 0x80000088, val);
 	if (val & 0x04) {
-		if (g_m_verbo > 1)
-			fprintf(stderr, "<-- rxdma[%d] Overflow detected!\r\n", ig);
+		if (g_m_verbo > 1) fprintf(stderr, "rxdma[%d] Overflow detected!\r\n", ig);
 		return 1;
 	}
 
@@ -859,78 +837,108 @@ int is_iiotxdma_underflow(int ig)
 	int ret;
 	uint32_t val;
 
-	ret = iio_device_reg_read(txdev[ig], 0x80000088, &val);
+	ret = iio_device_reg_read(iio_txdev[ig], 0x80000088, &val);
 	if (0 != ret) {
-		fprintf(stderr, "--> read txdma[%d] status failed %s\r\n",
-			ig, strerror(-ret));
+		fprintf(stderr, "txdma[%d] read-status failed %s\r\n", ig, strerror(-ret));
 		return -1;
 	}
-	if (g_m_verbo > 1)
-		printf("--> txdma[%d] status=0x%08x\r\n", ig, val);
+	if (g_m_verbo > 1) printf("txdma[%d] status=0x%08x\r\n", ig, val);
 
 	// Clear status bits by writting value back
-	if (0 != val) iio_device_reg_write(txdev[ig], 0x80000088, val);
+	if (0 != val) iio_device_reg_write(iio_txdev[ig], 0x80000088, val);
 	if (val & 0x01) {
-		if (g_m_verbo > 1)
-			fprintf(stderr, "--> txdma[%d] Underflow detected\r\n", ig);
+		if (g_m_verbo > 1) fprintf(stderr, "txdma[%d] Underflow detected\r\n", ig);
 		return 1;
 	}
 
 	return 0;
 }
 
-void libiio_app_startup(int rxdev_smp_nb, int txdev_smp_nb)
+int libiio_app_startup(int rxdev_smp_nb, int txdev_smp_nb)
 {
-	int ret, ig, ic;
-	struct iio_device *phy;
+	int ret, ig, ip;
 
     if (NULL == ctx) {
-        if (g_m_verbo > 0)
-            printf("* Acquiring IIO context\r\n");
 		ctx = iio_create_local_context();
-    	ASSERT((NULL != ctx) && "No context");
+    	ASSERT((NULL != ctx) && "context-local failed");
+
 		ret = iio_context_get_devices_count(ctx);
-    	ASSERT((ret > 0) && "No devices");
+    	ASSERT((ret > 0) && "No devices found");
     }
 
-	for (ig=0; ig<TOT_CHIP_NB; ig++) {
-#if 1
-        if (g_m_verbo > 0)
-            printf("LIBIIO_APP(g%d): Acquiring PHY device\r\n", ig);
-        phy = get_iio_dev(ctx, "adrv9371-phy");
-		ASSERT((ret > 0) && "No devices");
-        if (g_m_verbo > 0)
-            printf("LIBIIO_APP(g%d): Profiling PHY device\r\n", ig);
-        profile_ad9371_phy_array(phy);
-#endif
-		if (g_pth_msk & (EN_IIO_PATH_RX << ig)) {
-			init_phy_rxpath(ig);
+	for (ig = 0; ig < TOT_CHIP_NB; ig++) {
+		init_phy(ig);
+	}
+
+	if (g_pth_msk & EN_IIO_PATH_RX) {
+		for (ig = 0; ig < TOT_CHIP_NB; ig++) {
             ASSERT((rxdev_smp_nb > 0) && (rxdev_smp_nb <= IIO_SMP_MAX));
-            init_iio_rxpath(ig, rxdev_smp_nb);
-			if (0 == g_dst_way) {
-				char str_rxfile[16];
-				sscanf(str_rxfile, "%s%d", "rxsmp", g_chn_msk);
-				wfd = fopen(str_rxfile, "wb");
-			}
-        }
-		if (g_pth_msk & (EN_IIO_PATH_TX << ig)) {
-			init_phy_txpath(ig);
-            ASSERT((txdev_smp_nb > 0) && (txdev_smp_nb <= IIO_SMP_MAX));
-            init_iio_txpath(ig, txdev_smp_nb);
-			if (0 == g_src_way) {
-				char str_txfile[16];
-				sscanf(str_txfile, "%s%d", "txsmp", g_chn_msk);
-				rfd = fopen(str_txfile, "wb");
-			}
+            init_dlk_rxpath(ig, rxdev_smp_nb);
         }
 	}
+
+	if (g_pth_msk & EN_IIO_PATH_TX) {
+		for (ig = 0; ig < TOT_CHIP_NB; ig++) {
+            ASSERT((txdev_smp_nb > 0) && (txdev_smp_nb <= IIO_SMP_MAX));
+            init_dlk_txpath(ig, txdev_smp_nb);
+        }
+	}
+
+	return 0;
+}
+
+/* cleanup and exit */
+int libiio_app_shutdown(void)
+{
+	int ip, ig;
+
+	if (g_pth_msk & EN_IIO_PATH_RX) {
+		for (ig = 0; ig < TOT_CHIP_NB; ig++) {
+			if (0 == g_dst_way) {
+				fclose(g_wfd[ig*DEV_PORT_NB + ip]);
+			}
+
+			if (g_m_verbo > 2) printf("'DLK%d' Destroying iio_rxbuf ... ", ig);
+			if (iio_rxbuf[ig]) iio_buffer_destroy(iio_rxbuf[ig]);
+			if (g_m_verbo > 2) printf("Succeed\r\n");
+
+			if (g_m_verbo > 2) printf("'DLK%d' Disabling iio_rxchn ...", ig);
+			for (ip = 0; ip < TOT_PORT_NB; ip++) {
+				if (iiopr_chni[ip]) iio_channel_disable(iiopr_chni[ip]);
+				if (iiopr_chnq[ip]) iio_channel_disable(iiopr_chnq[ip]);
+			}
+			if (g_m_verbo > 2) printf("Succeed\r\n");
+		}
+	}
+
+	if (g_pth_msk & EN_IIO_PATH_TX) {
+		for (ig = 0; ig < TOT_CHIP_NB; ig++) {
+			if (0 == g_src_way) {
+				fclose(g_rfd[ig*DEV_PORT_NB + ip]);
+			}
+
+			if (g_m_verbo > 2) printf("'DLK%d' Destroying iio_txbuf ... ", ig);
+			if (iio_txbuf[ig]) iio_buffer_destroy(iio_txbuf[ig]);
+			if (g_m_verbo > 2) printf("Succeed\r\n");
+
+			if (g_m_verbo > 2) printf("'DLK%d' Disabling iio_txchn ...", ig);
+			for (ip = 0; ip < TOT_PORT_NB; ip++) {
+				if (iiopt_chni[ip]) iio_channel_disable(iiopt_chni[ip]);
+				if (iiopt_chnq[ip]) iio_channel_disable(iiopt_chnq[ip]);
+			}
+			if (g_m_verbo > 2) printf("Succeed\r\n");
+		}
+	}
+
+	if (ctx) { iio_context_destroy(ctx); ctx = NULL; }
+	return 0;
 }
 
 #if 1//!defined(BUILDING_RRU_UL) && !defined(BUILDING_RRU_DL)
 int main(int argc, char *argv[])
 {
-	int ig, ic;
-	struct timespec tm_xs, tm_xe;
+	int ret, ig, ip;
+	struct timespec ts, te;
 	double tm_us;
 	struct timespec old, new;
 
@@ -946,60 +954,44 @@ int main(int argc, char *argv[])
 	if (g_m_verbo > 0)
 		printf("* Starting IO streaming (press CTRL+C to cancel)\r\n");
 
-	clock_gettime(CLOCK_MONOTONIC, &tm_xs);
+	clock_gettime(CLOCK_MONOTONIC, &ts);
 	do {
-        for (ig=0; ig<TOT_CHIP_NB; ig++) {
-    		if (g_pth_msk & (EN_IIO_PATH_RX << ig)) {
+		if (g_pth_msk & EN_IIO_PATH_RX) {
+			for (ig = 0; ig < TOT_CHIP_NB; ig++) {
                 clock_gettime(CLOCK_MONOTONIC, &old);
     			handle_iio_rxpath(ig);
                 clock_gettime(CLOCK_MONOTONIC, &new);
                 printf("handle_iio_rxpath() take %.0f us REAL-TIME\r\n", 
                     elapse_us(&new, &old));
     		}
-    		if (g_pth_msk & (EN_IIO_PATH_TX << ig)) {
+		}
+
+    	if (g_pth_msk & EN_IIO_PATH_TX) {
+			for (ig = 0; ig < TOT_CHIP_NB; ig++) {
                 clock_gettime(CLOCK_MONOTONIC, &old);
     			handle_iio_txpath(ig);
                 clock_gettime(CLOCK_MONOTONIC, &new);
                 printf("handle_iio_txpath() take %.0f us REAL-TIME\r\n", 
                     elapse_us(&new, &old));
     		}
-            //printf("\r");
-            printf("RX[0] %4.6f MiSmp; TX[0] %4.6f MiSmp",
-                rxsnb[0]/1e6, txsnb[0]/1e6);
-            printf("\r\n");
-            fflush(stdout);
-        }
+    	}
+        printf("RX %4.6f MiSmp; TX %4.6f MiSmp\r\n",
+            rxsnb[0]/1e6, txsnb[0]/1e6);
 	} while (!stop);
 
-	clock_gettime(CLOCK_MONOTONIC, &tm_xe);
-	tm_us = elapse_us(&tm_xe, &tm_xs);
+	clock_gettime(CLOCK_MONOTONIC, &te);
+	tm_us = elapse_us(&te, &ts);
 	printf("\r\n");
-	for (ic=0; ic<DEV_CHN_NB; ic++) {
+	for (ip = 0; ip < DEV_PORT_NB; ip++) {
 		if (g_pth_msk & (EN_IIO_PATH_RX << ig))
 			printf("RX[%d] Total %4.6f MSmp in %f us (Throughput %7.3f Mbps)\r\n",
-				ic, rxsnb[0]/1e6, tm_us, rxsnb[0]/tm_us*32);
+				ip, rxsnb[0]/1e6, tm_us, rxsnb[0]/tm_us*32);
 		if (g_pth_msk & (EN_IIO_PATH_TX << ig))
 			printf("TX[%d] Total %4.6f MSmp in %f us (Throughput %7.3f Mbps)\r\n",
-				ic, txsnb[0]/1e6, tm_us, txsnb[0]/tm_us*32);
+				ip, txsnb[0]/1e6, tm_us, txsnb[0]/tm_us*32);
 	}
 
-	ig = 0;
-	if (g_pth_msk & (EN_IIO_PATH_RX << ig)) {
-		if (0 == g_dst_way) {
-			char str_rxfile[16];
-			sscanf(str_rxfile, "%s%d", "rxsmp", g_chn_msk);
-			fclose(wfd);
-		}
-	}
-	if (g_pth_msk & (EN_IIO_PATH_TX << ig)) {
-		if (0 == g_src_way) {
-			char str_txfile[16];
-			sscanf(str_txfile, "%s%d", "txsmp", g_chn_msk);
-			fclose(rfd);
-		}
-	}
-
-	shutdown();
+	libiio_app_shutdown();
 	return 0;
 }
 #endif

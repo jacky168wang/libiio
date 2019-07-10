@@ -36,22 +36,6 @@
 
 #include "common_jacky.h"
 
-/*==================================
-	for RRU only
-*/
-
-#define TOT_CHIP_NB 1	/* total chip number: TODO: 4 */
-#define DEV_PORT_NB 1	/* each chip has 2-RX & 2-TX ports: TODO: 2 */
-#define TOT_PORT_NB (TOT_CHIP_NB*DEV_PORT_NB)
-#define CHN_PER_PRT 2	/* each RX/TX port has one pair of I/Q channels */
-
-/*
-iio-internal-buffer is 4MiB at most (per libiio spec.) so 
-	  1 MiSample when 1-port(i.e. 2-channel)
-	512 KiSample when 2-port(i.e. 4-channel)
-*/
-#define IIO_SMP_MAX (1024*1024/DEV_PORT_NB)
-
 /*
 subcarrier   RB      symbo/samples
  5MHz        25       25*12=300

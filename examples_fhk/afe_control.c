@@ -4,8 +4,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define BIT(n) (1 << n)
-
 /* declaration of corresponding pointer*/
 static int memfd = -1;
 static void *phyaddr_this_base = NULL;
