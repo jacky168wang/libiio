@@ -2,7 +2,7 @@
  * applications based on libiio
  *   - type definitions and prototype declarations
  *
- * Copyright (C) 2018~2020 FHK Inc.
+ * Copyright (C) 2018~2020 Inc.
  * Author: Jacky Wang <kenwj@sina.com>
  *
  * License: GPL, version 2.1

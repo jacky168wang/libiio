@@ -17,7 +17,7 @@ fi
 #== Public Flags for PreCompile/Compile/Assemble/Link
 CFLAGS="$CFLAGS -I.. -I. -I./mykonos -I./talise"
 #CFLAGS="$CFLAGS -Wall"
-LD_LIBRARY_PATH=../fhk_arm_libs
+LD_LIBRARY_PATH=../cmake/armlibs
 #LD_LIBRARY_PATH=~/arm-linux-gnueabihf
 LDFLAGS="-L${LD_LIBRARY_PATH} -Wl,-rpath=${LD_LIBRARY_PATH}"
 LDFLAGS="$LDFLAGS -liio"

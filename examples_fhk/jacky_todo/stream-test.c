@@ -1052,21 +1052,25 @@ static int ad9009_TxPath_fromFile(int ig)
     char *buffertmp=NULL;
 
     if (readfd = fopen(in0Filename, "rb")) {
-        fseek(readfd, 0, SEEK_END);frame_size0 = ftell(readfd);
+        fseek(readfd, 0, SEEK_END);
+		frame_size0 = ftell(readfd);
         printf("Tx frame size is set to %d samples\r\n", frame_size0/4);
         fseek(readfd, 0, SEEK_SET);
-        filebuf0 = malloc((frame_size0));
+        filebuf0 = malloc(frame_size0);
         fread(filebuf0, 4, frame_size0/4, readfd);
         printf("%s len is %d bytes.", in0Filename, frame_size0); 
         fclose(readfd);
         for (int i = 0; i < frame_size0; i=i+4) {
             //exTemp = filebuf0[i];filebuf0[i] = filebuf0[i+3];filebuf0[i+3] = exTemp;
-            exTemp = filebuf0[i+1];filebuf0[i+1] = filebuf0[i+2];filebuf0[i+2] = exTemp;
+            exTemp = filebuf0[i+1];
+			filebuf0[i+1] = filebuf0[i+2];
+			filebuf0[i+2] = exTemp;
         }
     }
 
     if (readfd = fopen(in1Filename, "rb")) {
-        fseek(readfd, 0, SEEK_END);frame_size1 = ftell(readfd);
+        fseek(readfd, 0, SEEK_END);
+		frame_size1 = ftell(readfd);
         printf("Tx frame size is set to %d samples\r\n", frame_size1/4);
         fseek(readfd, 0, SEEK_SET);
         filebuf1 = malloc((frame_size1));
@@ -1075,7 +1079,9 @@ static int ad9009_TxPath_fromFile(int ig)
         fclose(readfd);
         for (int i = 0; i < frame_size1; i=i+4) {
             //exTemp = filebuf1[i];filebuf1[i] = filebuf1[i+3];filebuf1[i+3] = exTemp;
-            exTemp = filebuf1[i+1];filebuf1[i+1] = filebuf1[i+2];filebuf1[i+2] = exTemp;
+            exTemp = filebuf1[i+1];
+			filebuf1[i+1] = filebuf1[i+2];
+			filebuf1[i+2] = exTemp;
         }
     }
 
@@ -1100,7 +1106,6 @@ static int ad9009_TxPath_fromFile(int ig)
             }
             memcpy(p_d16, filebuf0 + 4*g_tsmp_nb*counter, 4*g_tsmp_nb);
             printf("memcopy %d bytes to  port%d iio-buffer", 4*g_tsmp_nb, g_prt_msk);
-            
         } else if (g_prt_msk == 0x2) {
             if (filebuf1 == NULL){
                 fprintf(stderr, "tx2 buffer is NULL\r\n");
@@ -1108,7 +1113,6 @@ static int ad9009_TxPath_fromFile(int ig)
             }
             memcpy(p_d16, filebuf1 + 4*g_tsmp_nb*counter, 4*g_tsmp_nb);
             printf("memcopy %d bytes to  port%d iio-buffer", 4*g_tsmp_nb, g_prt_msk);
-            
         } else if (g_prt_msk == 0x3) {
             if ((frame_size0 != frame_size1 || frame_size0 == 0 || frame_size1 == 0) && \
                 (filebuf1 == NULL || filebuf0 == NULL)) {
@@ -1498,7 +1502,6 @@ int main(int argc, char *argv[])
     		fprintf(stderr, "Failed to create monitor thread: %s\r\n",strerror(-ret));
     	}
     }
-        
 
 /******************************************************************/
 /******************************************************************/
